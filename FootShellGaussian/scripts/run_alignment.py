@@ -9,10 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from foot_prior.alignment import (
-    DEFAULT_TOE_ALLOWANCE_MM,
-    build_support_foot_fit,
-)
+from foot_prior.alignment import build_support_foot_fit
 from foot_prior.mesh import (
     TriangleMesh,
     combine_colored_meshes,
@@ -50,9 +47,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preparation-dir", required=True, type=Path)
     parser.add_argument("--supr-model", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument(
-        "--toe-allowance-mm", type=float, default=DEFAULT_TOE_ALLOWANCE_MM
-    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -234,14 +228,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         shoe_to_normalized=shoe_to_normalized,
         normalized_to_shoe=normalized_to_shoe,
         support_grid_cell_spacing=support_grid_cell_spacing,
-        toe_allowance_mm=args.toe_allowance_mm,
     )
     aligned_foot = TriangleMesh(support_fit.aligned_vertices, neutral_foot.faces)
     overlay = combine_colored_meshes(
         (normalized_shoe, SHOE_COLOR), (aligned_foot, FOOT_COLOR)
     )
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "shoe_profile": NORMAL_SHOE_PROFILE,
         "inputs": {
             "preparation_directory": str(preparation_dir),
@@ -302,6 +295,13 @@ def main() -> None:
         f"midfoot {float(angles['midfoot_pitch']):+.2f} degrees; "
         f"heel RMS {float(region_contact['heel']['rms_gap']):.6f}; "
         f"forefoot RMS {float(region_contact['forefoot']['rms_gap']):.6f}"
+    )
+    sizing = payload["sizing"]
+    assert isinstance(sizing, dict)
+    print(
+        f"foot ratio {float(sizing['foot_length_ratio']):.6f}; "
+        f"toe allowance {float(sizing['toe_allowance_mm']):.2f} mm "
+        f"(anchor {float(sizing['anchor_toe_allowance_mm']):.2f} mm)"
     )
 
 

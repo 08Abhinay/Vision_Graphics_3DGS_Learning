@@ -17,10 +17,23 @@ from .supr_foot import (
 
 PLANTAR_NORMAL_Y_MIN = float(np.cos(np.deg2rad(45.0)))
 MIN_PLANTAR_SUPPORT_COVERAGE = 0.95
+
+# Shoe-size policy, stated once. A normalized shoe's functional length is
+# defined to admit a neutral 250 mm foot with 12.5 mm of toe allowance, which
+# fixes the SUPR-to-normalized-shoe scale for every candidate. Foot length is
+# then an output of the SUPR shape parameters, never a search variable.
 REFERENCE_FOOT_LENGTH_MM = 250.0
-DEFAULT_TOE_ALLOWANCE_MM = 12.5
+ANCHOR_TOE_ALLOWANCE_MM = 12.5
+SHOE_FUNCTIONAL_LENGTH_MM = REFERENCE_FOOT_LENGTH_MM + ANCHOR_TOE_ALLOWANCE_MM
+ANCHOR_FOOT_LENGTH_RATIO = REFERENCE_FOOT_LENGTH_MM / SHOE_FUNCTIONAL_LENGTH_MM
+
+# The front allowance is deliberately one-sided. A foot may not run past the
+# functional toe, so MIN_TOE_ALLOWANCE_MM rejects. A shorter foot only leaves
+# more room, so MAX_TOE_ALLOWANCE_MM reports and never rejects.
 MIN_TOE_ALLOWANCE_MM = 10.0
 MAX_TOE_ALLOWANCE_MM = 15.0
+MIN_FOOT_LENGTH_RATIO = 0.80
+
 MIN_HEEL_SUPPORT_COVERAGE = 0.95
 MIN_FOREFOOT_SUPPORT_COVERAGE = 0.95
 MIN_TOE_SUPPORT_COVERAGE = 0.90
@@ -32,6 +45,35 @@ CONTACT_REGION_RANGES = {
     "forefoot": (0.55, 0.80),
     "toes": (0.80, 1.0),
 }
+
+
+def toe_allowance_to_foot_length_ratio(toe_allowance_mm: float) -> float:
+    """Convert physical front allowance to normalized heel-to-toe length.
+
+    Both conversions read the anchored shoe: one unit of normalized functional
+    length is SHOE_FUNCTIONAL_LENGTH_MM millimetres regardless of how long the
+    fitted foot turns out to be.
+    """
+
+    allowance = float(toe_allowance_mm)
+    if not np.isfinite(allowance) or allowance < 0.0:
+        raise ValueError("toe_allowance_mm must be finite and nonnegative")
+    return 1.0 - allowance / SHOE_FUNCTIONAL_LENGTH_MM
+
+
+def foot_length_ratio_to_toe_allowance(
+    foot_length_ratio: float,
+    heel_offset_x: float = 0.0,
+) -> float:
+    """Return front allowance implied by a normalized length and heel position."""
+
+    ratio = float(foot_length_ratio)
+    heel = float(heel_offset_x)
+    if not np.isfinite(ratio) or ratio <= 0.0:
+        raise ValueError("foot_length_ratio must be finite and positive")
+    if not np.isfinite(heel):
+        raise ValueError("heel_offset_x must be finite")
+    return SHOE_FUNCTIONAL_LENGTH_MM * (1.0 - heel - ratio)
 
 
 @dataclass(frozen=True)
@@ -86,8 +128,7 @@ class SupportFootFit:
     translation: np.ndarray
     reference_foot_length_mm: float
     toe_allowance_mm: float
-    target_foot_length_ratio: float
-    achieved_foot_length_ratio: float
+    foot_length_ratio: float
     support_grid_cell_spacing: float
     search: dict[str, Any]
     neutral_comparison: dict[str, Any]
@@ -144,9 +185,17 @@ class SupportFootFit:
             },
             "sizing": {
                 "reference_foot_length_mm": self.reference_foot_length_mm,
+                "shoe_functional_length_mm": SHOE_FUNCTIONAL_LENGTH_MM,
+                "anchor_toe_allowance_mm": ANCHOR_TOE_ALLOWANCE_MM,
+                "anchor_foot_length_ratio": ANCHOR_FOOT_LENGTH_RATIO,
+                "foot_length_ratio": self.foot_length_ratio,
                 "toe_allowance_mm": self.toe_allowance_mm,
-                "target_foot_length_ratio": self.target_foot_length_ratio,
-                "achieved_foot_length_ratio": self.achieved_foot_length_ratio,
+                "standard_toe_allowance_mm": [
+                    MIN_TOE_ALLOWANCE_MM,
+                    MAX_TOE_ALLOWANCE_MM,
+                ],
+                "minimum_toe_allowance_mm": MIN_TOE_ALLOWANCE_MM,
+                "minimum_foot_length_ratio": MIN_FOOT_LENGTH_RATIO,
             },
             "placement": {
                 "scale": self.scale,
@@ -188,10 +237,13 @@ class SupportFootFit:
 
 
 @dataclass(frozen=True)
-class _FitCandidate:
+class SupportPlacementCandidate:
+    """One valid posed-and-shaped SUPR placement on the saved support."""
+
     ankle_degrees: float
     midfoot_degrees: float
     pose: np.ndarray
+    betas: np.ndarray
     posed_vertices: np.ndarray
     posed_joints: np.ndarray
     aligned_vertices: np.ndarray
@@ -204,15 +256,39 @@ class _FitCandidate:
     distortion: dict[str, float | int]
     primary_score: float
     heel_forefoot_sum: float
+    toe_allowance_mm: float
+    foot_length_ratio: float
+    toe_x: float
+    heel_offset_x: float
+    lateral_offset_z: float
 
     def summary(self) -> dict[str, Any]:
         return {
             "ankle_pitch_degrees": self.ankle_degrees,
             "midfoot_pitch_degrees": self.midfoot_degrees,
+            "toe_allowance_mm": self.toe_allowance_mm,
+            "foot_length_ratio": self.foot_length_ratio,
+            "toe_x": self.toe_x,
+            "heel_offset_x": self.heel_offset_x,
+            "lateral_offset_z": self.lateral_offset_z,
             "primary_contact_score": self.primary_score,
             "heel_plus_forefoot_rms": self.heel_forefoot_sum,
             "region_contact": self.region_contact,
         }
+
+
+@dataclass(frozen=True)
+class SupportPlacementContext:
+    """Shoe and neutral-SUPR data shared by support-placement candidates."""
+
+    faces: np.ndarray
+    regions: SuprContactRegions
+    neutral_crosses: np.ndarray
+    neutral_areas: np.ndarray
+    normalized_shoe_bounds: np.ndarray
+    normalized_support_mesh: TriangleMesh
+    centerline: np.ndarray
+    length_scale: float
 
 
 @dataclass(frozen=True)
@@ -385,6 +461,23 @@ def transform_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
             "matrix maps at least one point to invalid homogeneous coordinates"
         )
     return transformed[:, :3] / transformed[:, 3, None]
+
+
+def neutral_length_scale(neutral_foot_mesh: TriangleMesh) -> float:
+    """Return the fixed SUPR-to-normalized-shoe scale set by the anchor.
+
+    The scale is derived from the neutral template alone, so a candidate's own
+    pose and shape never change it. Foot length in the shoe is therefore an
+    output of the SUPR parameters rather than something normalized away.
+    """
+
+    remapped = transform_points(
+        neutral_foot_mesh.vertices, make_supr_to_shoe_axis_remap()
+    )
+    length = float(np.ptp(remapped[:, 0]))
+    if not np.isfinite(length) or length <= 0.0:
+        raise ValueError("neutral SUPR foot must have positive remapped X length")
+    return ANCHOR_FOOT_LENGTH_RATIO / length
 
 
 def _uniform_scale_matrix(scale: float) -> np.ndarray:
@@ -704,6 +797,32 @@ def _candidate_distortion(
     }, None
 
 
+def build_support_placement_context(
+    neutral_foot_mesh: TriangleMesh,
+    normalized_shoe_mesh: TriangleMesh,
+    normalized_support_mesh: TriangleMesh,
+    normalized_centerline_xz: np.ndarray,
+) -> SupportPlacementContext:
+    """Prepare immutable geometry shared by support-placement candidates."""
+
+    centerline = _validated_centerline(normalized_centerline_xz)
+    neutral_crosses, neutral_areas = _triangle_geometry(
+        neutral_foot_mesh.vertices, neutral_foot_mesh.faces
+    )
+    if np.any(neutral_areas <= np.finfo(np.float64).eps):
+        raise ValueError("neutral SUPR template contains a degenerate triangle")
+    return SupportPlacementContext(
+        faces=neutral_foot_mesh.faces.copy(),
+        regions=identify_supr_contact_regions(neutral_foot_mesh),
+        neutral_crosses=neutral_crosses,
+        neutral_areas=neutral_areas,
+        normalized_shoe_bounds=normalized_shoe_mesh.bounds.copy(),
+        normalized_support_mesh=normalized_support_mesh,
+        centerline=centerline,
+        length_scale=neutral_length_scale(neutral_foot_mesh),
+    )
+
+
 def _weighted_rms(values: np.ndarray, weights: np.ndarray) -> float:
     return float(np.sqrt(np.sum(weights * np.square(values)) / np.sum(weights)))
 
@@ -743,22 +862,39 @@ def _coverage_and_gap_record(
     return record
 
 
-def _evaluate_fit_candidate(
+def evaluate_support_placement(
+    context: SupportPlacementContext,
     ankle_degrees: float,
     midfoot_degrees: float,
     pose: np.ndarray,
+    betas: np.ndarray,
     posed_vertices: np.ndarray,
     posed_joints: np.ndarray,
-    faces: np.ndarray,
-    regions: SuprContactRegions,
-    neutral_crosses: np.ndarray,
-    neutral_areas: np.ndarray,
-    normalized_support_mesh: TriangleMesh,
-    centerline: np.ndarray,
-    target_ratio: float,
-) -> tuple[_FitCandidate | None, str | None]:
+    reference_crosses: np.ndarray,
+    reference_areas: np.ndarray,
+    heel_offset_x: float = 0.0,
+    lateral_offset_z: float = 0.0,
+) -> tuple[SupportPlacementCandidate | None, str | None]:
+    """Place one SUPR pose/shape on support, or return a rejection reason.
+
+    The SUPR-to-shoe scale is the context's anchored constant, so this foot's
+    own length carries through to the shoe. ``reference_crosses`` and
+    ``reference_areas`` describe the same betas at zero pose, which keeps the
+    distortion gate measuring articulation rather than anatomy.
+    """
+
+    heel_offset = float(heel_offset_x)
+    lateral_offset = float(lateral_offset_z)
+    shape = np.asarray(betas, dtype=np.float64)
+    if not np.isfinite(heel_offset) or not np.isfinite(lateral_offset):
+        return None, "non_finite_placement_offset"
+    if shape.ndim != 1 or not np.isfinite(shape).all():
+        return None, "invalid_betas"
+
+    faces = context.faces
+    regions = context.regions
     distortion, rejection = _candidate_distortion(
-        posed_vertices, faces, neutral_crosses, neutral_areas
+        posed_vertices, faces, reference_crosses, reference_areas
     )
     if rejection is not None:
         return None, rejection
@@ -768,10 +904,26 @@ def _evaluate_fit_candidate(
     posed_length = float(np.ptp(remapped[:, 0]))
     if not np.isfinite(posed_length) or posed_length <= 0.0:
         return None, "invalid_foot_length"
-    scale = target_ratio / posed_length
+
+    # Length is now an output: the anchor fixes the scale, and the betas decide
+    # how much of the shoe the foot occupies.
+    scale = context.length_scale
+    foot_length_ratio = scale * posed_length
+    target_toe_x = heel_offset + foot_length_ratio
+    allowance = foot_length_ratio_to_toe_allowance(foot_length_ratio, heel_offset)
+    if allowance < MIN_TOE_ALLOWANCE_MM - 1e-9:
+        return None, "insufficient_toe_allowance"
+    if foot_length_ratio < MIN_FOOT_LENGTH_RATIO - 1e-12:
+        return None, "foot_shorter_than_diagnostic_limit"
+    if (
+        context.normalized_shoe_bounds[0, 0] > heel_offset + 1e-12
+        or context.normalized_shoe_bounds[1, 0] < target_toe_x - 1e-12
+    ):
+        return None, "foot_interval_outside_shoe"
+
     axis_and_scale = _uniform_scale_matrix(scale) @ make_supr_to_shoe_axis_remap()
     scaled = transform_points(posed_vertices, axis_and_scale)
-    translation_x = -float(np.min(scaled[:, 0]))
+    translation_x = heel_offset - float(np.min(scaled[:, 0]))
     x_aligned = scaled.copy()
     x_aligned[:, 0] += translation_x
 
@@ -789,17 +941,24 @@ def _evaluate_fit_candidate(
         return None, "degenerate_projected_plantar_face"
     centroid_x = centroids[:, 0]
     if (
-        float(np.min(centroid_x)) < centerline[0, 0] - 1e-12
-        or float(np.max(centroid_x)) > centerline[-1, 0] + 1e-12
+        float(np.min(centroid_x)) < context.centerline[0, 0] - 1e-12
+        or float(np.max(centroid_x)) > context.centerline[-1, 0] + 1e-12
     ):
         return None, "centerline_out_of_range"
-    centerline_z = np.interp(centroid_x, centerline[:, 0], centerline[:, 1])
+    centerline_z = np.interp(
+        centroid_x, context.centerline[:, 0], context.centerline[:, 1]
+    )
     residual_before = centroids[:, 2] - centerline_z
-    translation_z = float(-np.sum(weights * residual_before) / np.sum(weights))
+    centerline_translation_z = float(
+        -np.sum(weights * residual_before) / np.sum(weights)
+    )
+    translation_z = centerline_translation_z + lateral_offset
     residual_after = residual_before + translation_z
     lateral_fit: dict[str, float | int] = {
         "face_count": int(len(plantar_faces)),
         "projected_area": float(np.sum(weights)),
+        "centerline_translation_z": centerline_translation_z,
+        "lateral_offset_z": lateral_offset,
         "translation_z": translation_z,
         "rms_before_translation": _weighted_rms(residual_before, weights),
         "rms_after_translation": _weighted_rms(residual_after, weights),
@@ -815,11 +974,11 @@ def _evaluate_fit_candidate(
     horizontal_centroids = horizontal_vertices[faces[plantar_faces]].mean(axis=1)
     plantar_vertices = regions.plantar_vertex_indices
     vertex_y, vertex_valid = sample_triangle_mesh_y(
-        normalized_support_mesh,
+        context.normalized_support_mesh,
         horizontal_vertices[plantar_vertices][:, (0, 2)],
     )
     centroid_y, centroid_valid = sample_triangle_mesh_y(
-        normalized_support_mesh,
+        context.normalized_support_mesh,
         horizontal_centroids[:, (0, 2)],
     )
 
@@ -915,10 +1074,11 @@ def _evaluate_fit_candidate(
     }
     heel_rms = float(region_contact["heel"]["rms_gap"])
     forefoot_rms = float(region_contact["forefoot"]["rms_gap"])
-    return _FitCandidate(
+    return SupportPlacementCandidate(
         ankle_degrees=float(ankle_degrees),
         midfoot_degrees=float(midfoot_degrees),
         pose=pose.copy(),
+        betas=shape.copy(),
         posed_vertices=posed_vertices.copy(),
         posed_joints=posed_joints.copy(),
         aligned_vertices=aligned_vertices,
@@ -931,6 +1091,11 @@ def _evaluate_fit_candidate(
         distortion=distortion,
         primary_score=max(heel_rms, forefoot_rms),
         heel_forefoot_sum=heel_rms + forefoot_rms,
+        toe_allowance_mm=allowance,
+        foot_length_ratio=foot_length_ratio,
+        toe_x=target_toe_x,
+        heel_offset_x=heel_offset,
+        lateral_offset_z=lateral_offset,
     ), None
 
 
@@ -947,14 +1112,10 @@ def _angle_pairs(
 def _evaluate_angle_pairs(
     pairs: list[tuple[float, float]],
     supr_model: SuprFootModel,
-    faces: np.ndarray,
-    regions: SuprContactRegions,
-    neutral_crosses: np.ndarray,
-    neutral_areas: np.ndarray,
-    normalized_support_mesh: TriangleMesh,
-    centerline: np.ndarray,
-    target_ratio: float,
-) -> tuple[list[_FitCandidate], dict[str, int]]:
+    context: SupportPlacementContext,
+) -> tuple[list[SupportPlacementCandidate], dict[str, int]]:
+    """Evaluate pose candidates at zero betas against the neutral reference."""
+
     poses = np.zeros(
         (len(pairs), supr_model.num_pose_parameters), dtype=np.float32
     )
@@ -963,22 +1124,19 @@ def _evaluate_angle_pairs(
         poses[index, SUPR_MIDFOOT_PITCH_INDEX] = np.deg2rad(midfoot)
     betas = np.zeros((len(pairs), supr_model.num_betas), dtype=np.float32)
     posed_batch, joint_batch = supr_model.evaluate(poses, betas)
-    candidates: list[_FitCandidate] = []
+    candidates: list[SupportPlacementCandidate] = []
     rejections: dict[str, int] = {}
     for index, (ankle, midfoot) in enumerate(pairs):
-        candidate, rejection = _evaluate_fit_candidate(
+        candidate, rejection = evaluate_support_placement(
+            context,
             ankle,
             midfoot,
             poses[index],
+            betas[index],
             posed_batch[index],
             joint_batch[index],
-            faces,
-            regions,
-            neutral_crosses,
-            neutral_areas,
-            normalized_support_mesh,
-            centerline,
-            target_ratio,
+            context.neutral_crosses,
+            context.neutral_areas,
         )
         if candidate is None:
             assert rejection is not None
@@ -997,56 +1155,44 @@ def build_support_foot_fit(
     shoe_to_normalized: np.ndarray,
     normalized_to_shoe: np.ndarray,
     support_grid_cell_spacing: float,
-    toe_allowance_mm: float = DEFAULT_TOE_ALLOWANCE_MM,
 ) -> SupportFootFit:
-    """Fit ankle and midfoot pitch for balanced heel/forefoot support contact."""
+    """Fit ankle and midfoot pitch for balanced heel/forefoot support contact.
 
-    allowance = float(toe_allowance_mm)
-    if (
-        not np.isfinite(allowance)
-        or allowance < MIN_TOE_ALLOWANCE_MM
-        or allowance > MAX_TOE_ALLOWANCE_MM
-    ):
-        raise ValueError("toe_allowance_mm must lie in the inclusive range [10, 15]")
+    Sizing is not searched here. The anchor fixes the scale, so each pose keeps
+    whatever heel-to-toe length it actually has and the resulting front
+    allowance is reported rather than imposed.
+    """
+
     cell_spacing = float(support_grid_cell_spacing)
     if not np.isfinite(cell_spacing) or cell_spacing <= 0.0:
         raise ValueError("support_grid_cell_spacing must be finite and positive")
     shoe_to_normalized, normalized_to_shoe = _validated_inverse_pair(
         shoe_to_normalized, normalized_to_shoe
     )
-    centerline = _validated_centerline(normalized_centerline_xz)
     if not np.array_equal(supr_model.faces, neutral_foot_mesh.faces):
         raise ValueError("posable and neutral SUPR models must use identical faces")
-    target_ratio = REFERENCE_FOOT_LENGTH_MM / (
-        REFERENCE_FOOT_LENGTH_MM + allowance
-    )
     if (
         normalized_shoe_mesh.bounds[0, 0] > 1e-12
-        or normalized_shoe_mesh.bounds[1, 0] < target_ratio - 1e-12
+        or normalized_shoe_mesh.bounds[1, 0] < ANCHOR_FOOT_LENGTH_RATIO - 1e-12
     ):
         raise ValueError(
-            "normalized shoe outer X bounds do not contain the requested foot interval"
+            "normalized shoe outer X bounds do not contain the anchored foot interval"
         )
 
-    regions = identify_supr_contact_regions(neutral_foot_mesh)
-    neutral_crosses, neutral_areas = _triangle_geometry(
-        neutral_foot_mesh.vertices, neutral_foot_mesh.faces
+    context = build_support_placement_context(
+        neutral_foot_mesh,
+        normalized_shoe_mesh,
+        normalized_support_mesh,
+        normalized_centerline_xz,
     )
-    if np.any(neutral_areas <= np.finfo(np.float64).eps):
-        raise ValueError("neutral SUPR template contains a degenerate triangle")
+    regions = context.regions
 
     coarse_values = np.arange(-20.0, 20.0 + 1e-9, 2.0)
     coarse_pairs = _angle_pairs(coarse_values, coarse_values)
     coarse, coarse_rejections = _evaluate_angle_pairs(
         coarse_pairs,
         supr_model,
-        neutral_foot_mesh.faces,
-        regions,
-        neutral_crosses,
-        neutral_areas,
-        normalized_support_mesh,
-        centerline,
-        target_ratio,
+        context,
     )
     if not coarse:
         raise ValueError(
@@ -1079,13 +1225,7 @@ def build_support_foot_fit(
     fine, fine_rejections = _evaluate_angle_pairs(
         fine_pairs,
         supr_model,
-        neutral_foot_mesh.faces,
-        regions,
-        neutral_crosses,
-        neutral_areas,
-        normalized_support_mesh,
-        centerline,
-        target_ratio,
+        context,
     )
     if not fine:
         raise ValueError(
@@ -1093,7 +1233,7 @@ def build_support_foot_fit(
             f"{fine_rejections}"
         )
 
-    unique: dict[tuple[float, float], _FitCandidate] = {}
+    unique: dict[tuple[float, float], SupportPlacementCandidate] = {}
     for candidate in (*coarse, *fine):
         key = (round(candidate.ankle_degrees, 8), round(candidate.midfoot_degrees, 8))
         unique[key] = candidate
@@ -1126,7 +1266,6 @@ def build_support_foot_fit(
     posed_to_original = normalized_to_shoe @ posed_to_normalized
     original_to_posed = np.linalg.inv(posed_to_original)
     aligned_joints = transform_points(selected.posed_joints, posed_to_normalized)
-    achieved_ratio = float(np.ptp(selected.aligned_vertices[:, 0]))
     search = {
         "coarse": {
             "ankle_range_degrees": [-20.0, 20.0],
@@ -1180,9 +1319,8 @@ def build_support_foot_fit(
         scale=selected.scale,
         translation=selected.translation,
         reference_foot_length_mm=REFERENCE_FOOT_LENGTH_MM,
-        toe_allowance_mm=allowance,
-        target_foot_length_ratio=target_ratio,
-        achieved_foot_length_ratio=achieved_ratio,
+        toe_allowance_mm=selected.toe_allowance_mm,
+        foot_length_ratio=selected.foot_length_ratio,
         support_grid_cell_spacing=cell_spacing,
         search=search,
         neutral_comparison=neutral_comparison,

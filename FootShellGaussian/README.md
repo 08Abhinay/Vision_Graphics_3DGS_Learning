@@ -6,11 +6,18 @@ Shoe preparation validates the coordinate frame, detects the interior support,
 and constructs a reversible functional-length normalization. The current
 normal-shoe fit uses a fixed coordinate remap, uniform length scaling,
 functional-heel anchoring, footbed-centerline lateral placement, and a small
-CUDA search over SUPR ankle and midfoot pitch.
+CUDA search over SUPR ankle and midfoot pitch. The following cavity-analysis
+stage measures allowed footbed contact and unwanted contact with every other
+shoe surface. Collision-aware containment fitting then adjusts the ten SUPR
+shape parameters and support-constrained placement controls together to find a
+representative foot with realistic front clearance without losing plantar support. Foot size is not
+searched separately: a single anchored scale carries each candidate's own
+heel-to-toe length into the shoe, so the shape parameters change the foot the
+way real anatomy varies rather than uniformly shrinking one template.
 
-The project intentionally does not yet include SUPR shape fitting, toe
-articulation, full shoe-cavity collision fitting, SDFs, learned optimization,
-or shoe reconstruction. The archived prototype is available separately at
+The project intentionally does not yet include toe articulation, high-heel
+SUPR fitting, SDFs, learned optimization, or shoe reconstruction. The archived
+prototype is available separately at
 `../GShellFootPriorPrototype/` for reference only.
 
 ## Development setup
@@ -285,11 +292,19 @@ The 266-vertex neutral template defines fixed heel, arch, forefoot, and toe
 contact regions. Only SUPR pose entries 3 and 6 are changed: ankle pitch and
 midfoot pitch. Root motion, toe joints, and ten shape values remain zero.
 
-For each pose, the complete heel-to-longest-toe span is scaled to reserve a
-physical toe allowance. The default represents a 250 mm foot with 12.5 mm in
-front, so the foot occupies `250 / 262.5 = 0.95238095` of normalized functional
-length. `--toe-allowance-mm` accepts 10 through 15 mm. The rear-most posed foot
-point is anchored at `X=0`, and the longest toe ends at the resulting ratio.
+Sizing is anchored once rather than fitted per shoe. A normalized shoe's
+functional length is defined to admit the neutral 250 mm template with 12.5 mm
+in front, so one normalized unit is `262.5` mm and the neutral foot occupies
+`250 / 262.5 = 0.95238095`. That single constant fixes the SUPR-to-shoe scale
+for every candidate, so a posed or reshaped foot keeps whatever heel-to-toe
+length it actually has and the resulting front allowance is reported rather
+than imposed. The rear-most posed foot point sits at `X=0`.
+
+The allowance is deliberately one-sided. Less than 10 mm means the foot would
+run past the functional toe and is rejected. More than 15 mm only means the
+foot leaves extra room, which is recorded and never rejected. Plantarflexed
+poses genuinely shorten the heel-to-toe span, so they report more allowance
+than neutral ones.
 
 A single lateral translation fits plantar-face centroids to the saved footbed
 centerline using projected face area. The foot then moves vertically until the
@@ -314,11 +329,123 @@ posed SUPR frame to normalized and original shoe frames. SUPR articulation is
 non-rigid, so the JSON does not claim that a matrix maps the neutral template
 to the posed foot.
 
+## Cavity and collision analysis
+
+Checkpoint 6 consumes one completed normal-shoe preparation and its existing
+SUPR support fit. It does not detect the footbed, normalize the shoe, reload
+SUPR, or change the fitted foot.
+
+```bash
+python scripts/run_cavity_analysis.py \
+  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/canvas_shoe \
+  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_2/canvas_shoe \
+  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis/canvas_shoe
+```
+
+The original shoe-face indices stored in `shoe_preparation.json` divide the
+normalized shoe into two sets. Detected footbed faces permit plantar contact.
+Every remaining original shoe face is a physical obstacle, including the
+sidewalls, toe wall, heel cup, straps, tongue, upper, and collar. The ankle may
+pass through empty opening space, but touching the collar is still a collision.
+
+The analyzer first rechecks plantar gaps against the saved normalized
+footbed. It uses exact triangle intersections for physical crossings and also
+measures local signed clearance. At each foot sample it looks upward from the
+known footbed for an inner upper surface and outward from the stored centerline
+for an inner sidewall. Positive clearance is inside that local boundary;
+negative clearance means protrusion. If no surface exists in a direction, the
+space stays open. This deliberately avoids a watertight-volume assumption.
+Unsigned nearest-surface clearances are retained as additional diagnostics.
+
+The output directory receives exactly:
+
+```text
+cavity_analysis.json
+foot_clearance_colored.ply
+cavity_overlay.ply
+```
+
+The foot is blue where it is clear, yellow where it is close, magenta where it
+lies beyond a local upper or side boundary, and red where it contacts or
+intersects forbidden shoe geometry. Yellow is a review aid, not a failed fit.
+The JSON preserves exact original face mappings, support penetration results,
+nearest obstacle points, and clearance summaries for heel, arch, forefoot,
+toes, top, medial side, and lateral side. Status is `clear`,
+`protrusion_detected`, or `collisions_detected`; either problem status is a
+successful diagnostic rather than a runner failure. Cavity JSON schema 2 is
+required by the corrected containment stage.
+
+Pass `--overwrite` to replace only the three known cavity artifacts; unrelated
+files remain untouched. This CPU-only stage needs neither CUDA nor SUPR model
+loading. It currently accepts `shoe_profile="normal"` only.
+
+## Collision-aware containment fitting
+
+Checkpoint 7 consumes the accepted Checkpoint 5 support fit and Checkpoint 6
+cavity diagnosis. It validates and reproduces both before changing the foot.
+It never reruns footbed detection or normalization.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/run_containment_fit.py \
+  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/crocs \
+  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_anchored/crocs \
+  --cavity-analysis-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis_anchored/crocs \
+  --supr-model ../baselines/SUPR/data/supr_male_right_foot.npy \
+  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit_beta_search_review/crocs
+```
+
+The deterministic search first examines individual and coupled changes across
+all ten SUPR betas. It shortlists several different useful shapes, then jointly
+refines the betas, ankle pitch, midfoot pitch, heel position, and lateral
+position. Every candidate returns to the saved footbed using the same
+first-contact rule and must retain the existing plantar, heel, forefoot, and toe
+coverage.
+
+There is no separate size search. Under the anchored scale the shape parameters
+already move foot length across roughly `0.80` to `1.13` of functional length —
+beta 0 alone spans about `0.84` to `1.09` — which covers everything a uniform
+size schedule reached, and does so by changing the foot's proportions the way
+real feet differ rather than photocopying one template smaller. Beta 0 is used
+as SUPR's learned overall-size direction to bring broad candidates near 20 mm
+of front space. The other nine betas retain their coupled effects on length,
+width, height, instep, and lateral shape. No candidate is resized after its
+betas are applied.
+
+Only candidates leaving 18–22 mm in front can become the final result; 20 mm is
+the target. The score measures the union of exact-collision and signed-outside
+SUPR faces so one physical problem is not counted twice. It then considers
+collision area, protrusion depth, distance from 20 mm, beta magnitude, placement
+movement, and support contact. The final result cannot worsen either exact
+collision or signed-outside area relative to the input support fit. Lateral
+movement has no arbitrary grid-cell clamp: real support coverage and cavity
+geometry stop it. Heel movement is nonnegative and is bounded by toe space and
+support. Each beta stays within `[-3, 3]`.
+
+The output directory receives exactly:
+
+```text
+containment_fit.json
+foot_containment_fitted.ply
+foot_clearance_colored.ply
+containment_fit_overlay.ply
+```
+
+`status="contained_target_fit"` means containment was achieved with 18–22 mm
+of toe space. `status="residual_target_fit"` means no collision-free candidate
+was found in that same realistic-size band, so the least problematic candidate
+is saved with explicit residuals. The optimizer never reports a very short foot
+with excessive toe space as success. The overlay uses the same
+blue/yellow/magenta/red meanings as Checkpoint 6.
+
+This stage requires CUDA for batched SUPR pose and shape generation. Exact
+shoe collision checks remain CPU geometry calculations. Pass `--overwrite` to
+replace only the four known containment artifacts.
+
 ## Current limitations
 
 The selected canvas footbed contains one genuine rectangular source-topology
 hole. The implementation reports missing support there rather than repairing
-it. This checkpoint balances contact against the detected support only. It does
-not yet measure the heel cup, toe wall, sidewalls, or upper, and therefore does
-not claim full cavity containment or a collision-free fit. Shape fitting, toe
-curl, and complete shoe-volume clearance belong to later checkpoints.
+it. Cavity analysis measures heel-cup, toe-wall, sidewall, collar, and upper
+contact. Containment fitting now responds with support-constrained placement and SUPR shape
+changes, but it does not guarantee that every open or difficult shoe becomes
+collision-free. Toe curl and other localized articulation remain deferred.

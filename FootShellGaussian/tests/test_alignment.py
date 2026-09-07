@@ -12,13 +12,17 @@ import numpy as np
 import pytest
 
 from foot_prior.alignment import (
-    DEFAULT_TOE_ALLOWANCE_MM,
+    ANCHOR_FOOT_LENGTH_RATIO,
+    ANCHOR_TOE_ALLOWANCE_MM,
+    MIN_TOE_ALLOWANCE_MM,
     REFERENCE_FOOT_LENGTH_MM,
+    SHOE_FUNCTIONAL_LENGTH_MM,
     identify_supr_contact_regions,
     make_supr_to_shoe_axis_remap,
+    neutral_length_scale,
     transform_points,
 )
-from foot_prior.mesh import load_triangle_mesh
+from foot_prior.mesh import TriangleMesh, load_triangle_mesh
 from foot_prior.supr_foot import (
     SUPR_ANKLE_PITCH_INDEX,
     SUPR_MIDFOOT_PITCH_INDEX,
@@ -80,6 +84,22 @@ def test_exact_axis_remap_and_contact_region_partition() -> None:
     }
 
 
+def test_anchor_scale_comes_only_from_the_neutral_template() -> None:
+    neutral = load_neutral_supr_foot(SUPR_MODEL)
+    scale = neutral_length_scale(neutral)
+    remapped = transform_points(neutral.vertices, make_supr_to_shoe_axis_remap())
+    assert scale * float(np.ptp(remapped[:, 0])) == pytest.approx(
+        ANCHOR_FOOT_LENGTH_RATIO, abs=1e-12
+    )
+    # A differently shaped foot must not move the scale; that is what makes
+    # length an output of the SUPR shape parameters.
+    reshaped = TriangleMesh(neutral.vertices * 0.9, neutral.faces)
+    assert neutral_length_scale(reshaped) == pytest.approx(scale / 0.9)
+    assert REFERENCE_FOOT_LENGTH_MM / ANCHOR_FOOT_LENGTH_RATIO == pytest.approx(
+        SHOE_FUNCTIONAL_LENGTH_MM
+    )
+
+
 def test_runner_uses_saved_support_and_writes_reversible_fit(
     tmp_path: Path,
 ) -> None:
@@ -117,17 +137,27 @@ def test_runner_uses_saved_support_and_writes_reversible_fit(
     assert {path.name for path in output.iterdir()} == ARTIFACT_NAMES | {"keep.txt"}
 
     payload = json.loads((output / "support_fit.json").read_text())
-    expected_ratio = REFERENCE_FOOT_LENGTH_MM / (
-        REFERENCE_FOOT_LENGTH_MM + DEFAULT_TOE_ALLOWANCE_MM
+    assert payload["schema_version"] == 2
+    sizing = payload["sizing"]
+    assert sizing["anchor_foot_length_ratio"] == pytest.approx(
+        ANCHOR_FOOT_LENGTH_RATIO
     )
-    assert payload["sizing"]["target_foot_length_ratio"] == pytest.approx(
-        expected_ratio
+    assert sizing["anchor_toe_allowance_mm"] == pytest.approx(
+        ANCHOR_TOE_ALLOWANCE_MM
     )
-    assert payload["sizing"]["achieved_foot_length_ratio"] == pytest.approx(
-        expected_ratio
+    assert sizing["shoe_functional_length_mm"] == pytest.approx(
+        SHOE_FUNCTIONAL_LENGTH_MM
     )
+    # Length is no longer dialled in: it is whatever the posed foot measures
+    # under the anchored scale, so it need not equal the anchor ratio. Only the
+    # hard front-allowance floor is enforced.
+    ratio = sizing["foot_length_ratio"]
+    assert sizing["toe_allowance_mm"] == pytest.approx(
+        SHOE_FUNCTIONAL_LENGTH_MM * (1.0 - ratio)
+    )
+    assert sizing["toe_allowance_mm"] >= MIN_TOE_ALLOWANCE_MM - 1e-9
     assert payload["bounds"]["aligned_foot"][0][0] == pytest.approx(0.0)
-    assert payload["bounds"]["aligned_foot"][1][0] == pytest.approx(expected_ratio)
+    assert payload["bounds"]["aligned_foot"][1][0] == pytest.approx(ratio)
     pose = np.asarray(payload["supr"]["pose_parameters_radians"])
     inactive = np.ones(len(pose), dtype=bool)
     inactive[[SUPR_ANKLE_PITCH_INDEX, SUPR_MIDFOOT_PITCH_INDEX]] = False
@@ -138,10 +168,17 @@ def test_runner_uses_saved_support_and_writes_reversible_fit(
     assert contact["heel"]["projected_area_coverage"] >= 0.95
     assert contact["forefoot"]["projected_area_coverage"] >= 0.95
     assert contact["toes"]["projected_area_coverage"] >= 0.90
-    assert min(record["minimum_gap"] for record in contact.values()) == pytest.approx(
-        0.0, abs=1e-10
+    # First contact is the closest of the plantar vertices and the face
+    # centroids, so the invariant holds over their union, not over centroids
+    # alone -- which of the two touches first depends on the selected pose.
+    vertices = payload["support_contact"]["plantar_vertices"]
+    closest = min(
+        min(record["minimum_gap"] for record in contact.values()),
+        vertices["minimum_gap"],
     )
+    assert closest == pytest.approx(0.0, abs=1e-10)
     assert all(record["minimum_gap"] >= -1e-10 for record in contact.values())
+    assert vertices["minimum_gap"] >= -1e-10
     lateral = payload["lateral_centerline_fit"]
     assert lateral["rms_after_translation"] <= lateral["rms_before_translation"]
 

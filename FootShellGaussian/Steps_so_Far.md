@@ -23,6 +23,7 @@ normal
   -> calculate reversible functional-length normalization
   -> write footbed review and normalized-shoe artifacts
   -> fit SUPR ankle and midfoot pitch against the saved normalized support
+  -> measure footbed contact and clearance from every other shoe surface
 
 high_heel
   -> detect the inclined interior support
@@ -57,6 +58,9 @@ FootShell outputs:
 
 Normal-shoe SUPR support fits:
 /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit
+
+Normal-shoe cavity analyses:
+/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis
 ```
 
 The manifest and processed dataset paths remain stable as shoes are added. Do
@@ -478,8 +482,11 @@ cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
 ```
 
 This stage requires CUDA. It tests only ankle and midfoot pitch; all toe joints
-and SUPR shape values remain zero. The default reserves 12.5 mm in front of a
-representative 250 mm foot. The runner anchors the rear foot at `X=0`, aligns it
+and SUPR shape values remain zero. Sizing is anchored once, not chosen per shoe:
+a shoe's functional length is defined to admit the neutral 250 mm foot with
+12.5 mm in front, which fixes the scale. Each pose then keeps its own
+heel-to-toe length, so a plantarflexed foot honestly reports more front
+allowance than a neutral one. The runner anchors the rear foot at `X=0`, aligns it
 sideways to the saved footbed centerline, and selects the near-neutral pose that
 best balances heel and forefoot support contact. It writes:
 
@@ -492,14 +499,137 @@ support_fit_overlay.ply
 
 Inspect `support_fit_overlay.ply` together with
 `footbed_normalized.ply`. Confirm that the foot is upright, toes point toward
-`+X`, the rear begins at `X=0`, the longest toe ends near `X=0.952`, the foot
+`+X`, the rear begins at `X=0`, the longest toe ends near `X=0.95` (a strongly
+plantarflexed pose ends a little short of that, which is expected), the foot
 follows the green support laterally, and heel and forefoot approach the support
-without obvious plantar penetration. Pass `--overwrite` only when deliberately
-regenerating these four known artifacts. Use `--toe-allowance-mm` only within
-the documented 10 to 15 mm range.
+without obvious plantar penetration. Check the printed toe allowance: below
+10 mm is refused outright, and above 15 mm is recorded rather than refused.
+Pass `--overwrite` only when deliberately regenerating these four known
+artifacts.
 
 This command rejects `shoe_profile="high_heel"`. High-heel SUPR placement needs
 plantarflexion and remains a later checkpoint.
+
+## Step 12: Measure cavity collision and clearance
+
+This step reads the normalized shoe and completed support fit. It does not
+rerun preparation, footbed detection, normalization, or SUPR fitting.
+
+```bash
+cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
+
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_cavity_analysis.py \
+  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/canvas_shoe \
+  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_2/canvas_shoe \
+  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis/canvas_shoe
+```
+
+The detected footbed is the only shoe surface on which contact is allowed.
+Every other original shoe triangle is treated as an obstacle. The ankle is
+allowed to emerge through the empty shoe opening, but it may not intersect the
+collar. The command writes:
+
+```text
+cavity_analysis.json
+foot_clearance_colored.ply
+cavity_overlay.ply
+```
+
+Open `cavity_overlay.ply`. Blue regions are clear, yellow regions are close,
+magenta regions have passed a local upper or side boundary, and red regions
+touch or cross a forbidden shoe surface. Inspect the existing green
+`footbed_normalized.ply` from the support-fit directory beside it when checking
+plantar contact.
+
+The schema-2 JSON status is `clear`, `protrusion_detected`, or
+`collisions_detected`. The local signed test keeps real openings open: it does
+not add an imaginary lid or require a closed shoe mesh. A problem status is an
+expected diagnostic and does not mean the command failed.
+
+To analyze all currently fitted normal shoes without changing their existing
+outputs:
+
+```bash
+cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
+
+for shoe_dir in /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_2/*; do
+  shoe=$(basename "$shoe_dir")
+  /home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+    scripts/run_cavity_analysis.py \
+    --preparation-dir "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/$shoe" \
+    --support-fit-dir "$shoe_dir" \
+    --output-dir "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis/$shoe"
+done
+```
+
+Use `--overwrite` only when deliberately regenerating the three known cavity
+artifacts for a shoe. This stage runs on the CPU and does not require a GPU.
+
+## Step 13: Fit SUPR to the measured cavity
+
+This normal-shoe-only step reads the accepted support fit and cavity analysis.
+It verifies that both can be reproduced, then searches for a natural SUPR foot
+with 18–22 mm of front space that best fits the measured local cavity. It does not redetect the footbed or
+renormalize the shoe. Regenerate Steps 11 and 12 first because this runner
+requires the current schema-2 support fit and schema-2 cavity record.
+
+```bash
+cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
+
+CUDA_VISIBLE_DEVICES=1 \
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_containment_fit.py \
+  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/crocs \
+  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_anchored/crocs \
+  --cavity-analysis-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis_anchored/crocs \
+  --supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male_right_foot.npy \
+  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit_beta_search_review/crocs
+```
+
+The command writes:
+
+```text
+containment_fit.json
+foot_containment_fitted.ply
+foot_clearance_colored.ply
+containment_fit_overlay.ply
+```
+
+The search broadly samples individual and coupled changes across all ten SUPR
+shape values, keeps several different promising feet, and then jointly refines
+them together with heel/lateral and ankle/midfoot corrections. Every candidate
+returns to first contact with the saved support and must retain heel, forefoot,
+toe, and overall support coverage.
+
+Foot size is not searched separately. Because the scale is anchored, the shape
+values themselves change how long, wide, and tall the foot is, so a smaller
+foot here is a genuinely different foot rather than the same one shrunk. Beta 0
+guides broad candidates toward the requested length, while the other betas keep
+their natural correlated shape effects. No shaped candidate is uniformly
+rescaled afterward. The final mesh must leave 18–22 mm in front, with 20 mm as
+the target.
+
+Open `containment_fit_overlay.ply` and load the existing green
+`footbed_normalized.ply` from the matching `support_fit_2` directory. Confirm
+that the foot remains anatomical and supported. Blue is clear, yellow is near
+an obstacle, magenta is beyond a local boundary, and red is an exact forbidden
+collision.
+
+The JSON status has two outcomes:
+
+- `contained_target_fit`: contained with 18–22 mm toe allowance.
+- `residual_target_fit`: no collision-free shape was found in the same toe-space
+  band, so the safest realistic-size result was saved with its remaining
+  problem areas for the next stage.
+
+The fitter does not quietly solve collisions by leaving a large empty region in
+front of the toes. The schema-4 JSON records the complete broad shortlist,
+local restarts, ten betas, actual foot dimensions, and the union of all exact
+collision and signed-protrusion faces.
+
+Use `--overwrite` only when deliberately replacing these four known artifacts.
+CUDA generates SUPR candidates; exact shoe collision checks run on the CPU.
 
 ## Failure rules
 
@@ -515,13 +645,7 @@ plantarflexion and remains a later checkpoint.
 
 ## What comes next
 
-The current normal-shoe endpoint is articulated support fitting. The next
-major project stage is cavity containment fitting:
-
-- Normal shoes: evaluate heel-cup, toe-wall, sidewall, and upper clearance, then
-  fit SUPR shape without producing implausible deformation.
-- High heels: add deterministic SUPR plantarflexion using the recorded heel and
-  forefoot support measurements, then fit the posed foot against the support.
-
-When those stages are implemented, append their exact commands, outputs, and
-visual checks to this file.
+The current normal-shoe endpoint is collision-aware containment fitting. The
+next checkpoint may use toe articulation and other localized SUPR controls for
+red areas that cannot be resolved by global shape and small rigid placement
+changes. High-heel SUPR fitting is intentionally outside the current scope.
