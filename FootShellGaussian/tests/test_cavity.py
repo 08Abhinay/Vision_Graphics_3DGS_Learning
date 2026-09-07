@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from foot_prior.cavity import analyze_fitted_foot_cavity
+from foot_prior.cavity import CavityEvaluator, analyze_fitted_foot_cavity
 from foot_prior.mesh import TriangleMesh
 
 
@@ -198,6 +198,50 @@ def test_side_protrusion_is_signed_without_triangle_crossing() -> None:
     assert len(result.collision_pairs) == 0
     assert result.status == "protrusion_detected"
     assert result.signed_clearance.outside_area_fraction > 0.0
+
+
+def test_signed_exemption_does_not_disable_exact_collision() -> None:
+    shoe, footbed, source_faces = _shoe("upper")
+    beyond = _foot(bottom_y=-0.25, top_y=-0.35)
+    evaluator = CavityEvaluator.build(
+        shoe,
+        footbed,
+        source_faces,
+        beyond,
+        np.asarray([[0.0, 0.0], [1.0, 0.0]]),
+    )
+    all_vertices = np.arange(len(beyond.vertices), dtype=np.int64)
+    all_faces = np.arange(len(beyond.faces), dtype=np.int64)
+    signed_exempt = evaluator.analyze(
+        beyond,
+        np.asarray([4, 5, 6, 7]),
+        np.asarray([2, 3]),
+        all_vertices,
+        all_faces,
+    )
+    assert signed_exempt.status == "clear"
+    assert len(signed_exempt.signed_clearance.outside_face_indices) == 0
+    assert np.isfinite(
+        signed_exempt.signed_clearance.vertex_upper_clearances
+    ).any()
+
+    crossing = _foot(bottom_y=0.0, top_y=-0.3)
+    collision_evaluator = CavityEvaluator.build(
+        shoe,
+        footbed,
+        source_faces,
+        crossing,
+        np.asarray([[0.0, 0.0], [1.0, 0.0]]),
+    )
+    still_colliding = collision_evaluator.analyze(
+        crossing,
+        np.asarray([4, 5, 6, 7]),
+        np.asarray([2, 3]),
+        np.arange(len(crossing.vertices), dtype=np.int64),
+        np.arange(len(crossing.faces), dtype=np.int64),
+    )
+    assert still_colliding.status == "collisions_detected"
+    assert len(still_colliding.collision_pairs) > 0
 
 
 def test_winding_and_repeated_evaluation_do_not_change_results() -> None:

@@ -584,7 +584,7 @@ CUDA_VISIBLE_DEVICES=1 \
   --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_anchored/crocs \
   --cavity-analysis-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis_anchored/crocs \
   --supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male_right_foot.npy \
-  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit_beta_search_review/crocs
+  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit_beta_expanded_search/crocs
 ```
 
 The command writes:
@@ -596,11 +596,13 @@ foot_clearance_colored.ply
 containment_fit_overlay.ply
 ```
 
-The search broadly samples individual and coupled changes across all ten SUPR
-shape values, keeps several different promising feet, and then jointly refines
-them together with heel/lateral and ankle/midfoot corrections. Every candidate
-returns to first contact with the saved support and must retain heel, forefoot,
-toe, and overall support coverage.
+The search keeps the earlier individual and coupled ten-beta shapes and adds
+256 deterministic varied-magnitude combinations across betas 1–9. Beta 0 is
+solved toward 18, 20, and 22 mm for each new combination. Every support-valid
+shape in that band receives an exact collision check. Ten beta-diverse results
+are then refined together with heel/lateral and ankle/midfoot corrections.
+Every candidate returns to first contact with the saved support and must retain
+heel, forefoot, toe, and overall support coverage.
 
 Foot size is not searched separately. Because the scale is anchored, the shape
 values themselves change how long, wide, and tall the foot is, so a smaller
@@ -611,10 +613,16 @@ rescaled afterward. The final mesh must leave 18–22 mm in front, with 20 mm as
 the target.
 
 Open `containment_fit_overlay.ply` and load the existing green
-`footbed_normalized.ply` from the matching `support_fit_2` directory. Confirm
+`footbed_normalized.ply` from the matching `support_fit_anchored` directory. Confirm
 that the foot remains anatomical and supported. Blue is clear, yellow is near
 an obstacle, magenta is beyond a local boundary, and red is an exact forbidden
 collision.
+
+The part of the anatomical ankle above the posed ankle joint and behind the
+posed midfoot joint is ignored only by the signed upper/side score, allowing it
+to emerge through a genuinely open entrance. Exact intersections are still
+checked on the complete ankle, so a collar collision remains red and affects
+selection.
 
 The JSON status has two outcomes:
 
@@ -624,9 +632,10 @@ The JSON status has two outcomes:
   problem areas for the next stage.
 
 The fitter does not quietly solve collisions by leaving a large empty region in
-front of the toes. The schema-4 JSON records the complete broad shortlist,
-local restarts, ten betas, actual foot dimensions, and the union of all exact
-collision and signed-protrusion faces.
+front of the toes. The schema-5 JSON records the ankle exemption, expanded
+seed configuration, exact broad candidates, ten refinement starts, ten betas,
+actual foot dimensions, and the union of exact collision and non-exempt signed
+protrusion faces.
 
 Use `--overwrite` only when deliberately replacing these four known artifacts.
 CUDA generates SUPR candidates; exact shoe collision checks run on the CPU.

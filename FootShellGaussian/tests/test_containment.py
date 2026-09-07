@@ -7,6 +7,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,6 +26,7 @@ from foot_prior.alignment import (
 )
 from foot_prior.containment import (
     BETA_AXIS_MAGNITUDES,
+    LATIN_HYPERCUBE_SAMPLE_COUNT,
     MAX_TARGET_TOE_ALLOWANCE_MM,
     MIN_TARGET_TOE_ALLOWANCE_MM,
     TARGET_MAX_RATIO,
@@ -32,8 +34,10 @@ from foot_prior.containment import (
     TARGET_TOE_ALLOWANCE_MM,
     _Parameters,
     _Search,
+    _ankle_signed_exemptions,
     _beta_templates,
     _hadamard,
+    _latin_hypercube_beta_templates,
     _minimum_norm_joint_update,
     affected_area_fraction,
     collision_area_fraction,
@@ -244,6 +248,52 @@ def test_broad_templates_cover_all_ten_betas_and_coupled_shapes() -> None:
     np.testing.assert_allclose(matrix @ matrix.T, 16.0 * np.eye(16))
 
 
+def test_latin_hypercube_templates_are_deterministic_and_varied() -> None:
+    initial = _Parameters(0.0, 0.0, 0.0, 0.0, np.zeros(10))
+    first = _latin_hypercube_beta_templates(initial)
+    second = _latin_hypercube_beta_templates(initial)
+    assert first.shape == (LATIN_HYPERCUBE_SAMPLE_COUNT, 10)
+    np.testing.assert_array_equal(first, second)
+    np.testing.assert_array_equal(first[:, 0], np.zeros(len(first)))
+    assert np.all(np.abs(first[:, 1:]) <= 3.0)
+    assert any(len(np.unique(np.round(row[1:], 6))) > 2 for row in first)
+    for dimension in range(1, 10):
+        bins = np.floor(
+            (first[:, dimension] + 3.0) / 6.0
+            * LATIN_HYPERCUBE_SAMPLE_COUNT
+        ).astype(np.int64)
+        bins = np.clip(bins, 0, LATIN_HYPERCUBE_SAMPLE_COUNT - 1)
+        np.testing.assert_array_equal(
+            np.sort(bins), np.arange(LATIN_HYPERCUBE_SAMPLE_COUNT)
+        )
+
+
+def test_ankle_exemption_uses_posed_joint_boundaries() -> None:
+    vertices = np.asarray(
+        [
+            [0.1, -0.5, 0.0],
+            [0.2, -0.2, 0.0],
+            [0.4, -0.1, 0.0],
+            [0.7, -0.5, 0.0],
+            [0.1, 0.1, 0.0],
+        ]
+    )
+    joints = np.zeros((13, 3), dtype=np.float64)
+    joints[1] = [0.2, 0.0, 0.0]
+    joints[2] = [0.5, 0.0, 0.0]
+    faces = np.asarray([[0, 1, 2], [0, 2, 3], [0, 1, 4]], dtype=np.int64)
+    placement = SimpleNamespace(
+        posed_joints=joints,
+        aligned_vertices=vertices,
+        transform=np.eye(4),
+    )
+    exempt_vertices, exempt_faces = _ankle_signed_exemptions(
+        placement, faces, 1e-9
+    )
+    np.testing.assert_array_equal(exempt_vertices, np.asarray([0, 1, 2]))
+    np.testing.assert_array_equal(exempt_faces, np.asarray([0]))
+
+
 def test_lateral_offset_has_no_fixed_grid_cell_clamp() -> None:
     initial = _Parameters(0.0, 0.0, 0.0, 0.0, np.zeros(10))
     search = object.__new__(_Search)
@@ -307,7 +357,7 @@ def _run(*arguments: object) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_real_normal_shoe_writes_schema2_containment_fit(tmp_path: Path) -> None:
+def test_real_normal_shoe_writes_schema5_containment_fit(tmp_path: Path) -> None:
     preparation = OUTPUT_ROOT / "shoe_preparation_2/aj_12_basketball_sneakers"
     support_fit = OUTPUT_ROOT / "support_fit_2/aj_12_basketball_sneakers"
     cavity = OUTPUT_ROOT / "cavity_analysis/aj_12_basketball_sneakers"
@@ -339,7 +389,7 @@ def test_real_normal_shoe_writes_schema2_containment_fit(tmp_path: Path) -> None
     completed = _run(*arguments)
     assert completed.returncode == 0, completed.stderr
     payload = json.loads((output / "containment_fit.json").read_text())
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert payload["status"] in {
         "contained_target_fit",
         "residual_target_fit",

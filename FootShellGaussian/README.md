@@ -391,15 +391,17 @@ CUDA_VISIBLE_DEVICES=1 python scripts/run_containment_fit.py \
   --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_anchored/crocs \
   --cavity-analysis-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis_anchored/crocs \
   --supr-model ../baselines/SUPR/data/supr_male_right_foot.npy \
-  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit_beta_search_review/crocs
+  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit_beta_expanded_search/crocs
 ```
 
-The deterministic search first examines individual and coupled changes across
-all ten SUPR betas. It shortlists several different useful shapes, then jointly
-refines the betas, ankle pitch, midfoot pitch, heel position, and lateral
-position. Every candidate returns to the saved footbed using the same
-first-contact rule and must retain the existing plantar, heel, forefoot, and toe
-coverage.
+The deterministic search retains the individual and coupled ten-beta shapes
+used previously, then adds 256 varied-magnitude shapes sampled across betas
+1–9. For each varied shape, beta 0 is solved toward 18, 20, and 22 mm of front
+space. Every support-valid candidate in that band receives the exact collision
+check. Ten beta-diverse results are then jointly refined over all ten betas,
+ankle pitch, midfoot pitch, heel position, and lateral position. Every
+candidate returns to the saved footbed using the same first-contact rule and
+must retain plantar, heel, forefoot, and toe coverage.
 
 There is no separate size search. Under the anchored scale the shape parameters
 already move foot length across roughly `0.80` to `1.13` of functional length —
@@ -412,8 +414,12 @@ width, height, instep, and lateral shape. No candidate is resized after its
 betas are applied.
 
 Only candidates leaving 18–22 mm in front can become the final result; 20 mm is
-the target. The score measures the union of exact-collision and signed-outside
-SUPR faces so one physical problem is not counted twice. It then considers
+the target. The anatomical exit above the posed ankle and behind the posed
+midfoot is omitted from signed upper/side scoring, because an ankle may emerge
+through an open entrance. Exact intersection remains active on every ankle
+face, so contact with the collar is never hidden. The score measures the union
+of exact-collision and non-exempt signed-outside SUPR faces so one physical
+problem is not counted twice. It then considers
 collision area, protrusion depth, distance from 20 mm, beta magnitude, placement
 movement, and support contact. The final result cannot worsen either exact
 collision or signed-outside area relative to the input support fit. Lateral
@@ -439,7 +445,9 @@ blue/yellow/magenta/red meanings as Checkpoint 6.
 
 This stage requires CUDA for batched SUPR pose and shape generation. Exact
 shoe collision checks remain CPU geometry calculations. Pass `--overwrite` to
-replace only the four known containment artifacts.
+replace only the four known containment artifacts. The result JSON uses schema
+5 and records the ankle exemptions, deterministic expanded seeds, all exact
+broad candidates, and the ten refinement starts.
 
 ## Current limitations
 

@@ -30,6 +30,8 @@ class SignedCavityClearance:
     face_side_faces: np.ndarray
     face_side_points: np.ndarray
     face_combined_clearances: np.ndarray
+    signed_exempt_vertex_indices: np.ndarray
+    signed_exempt_face_indices: np.ndarray
     outside_vertex_indices: np.ndarray
     outside_face_indices: np.ndarray
     outside_area: float
@@ -54,6 +56,14 @@ class SignedCavityClearance:
                 "zero": "foot sample touches its local inner boundary",
                 "negative": "foot sample lies beyond its local inner boundary",
                 "open_space": "no boundary is invented when no shoe surface is found",
+                "signed_exemptions": (
+                    "listed SUPR samples are omitted only from signed upper/side "
+                    "scoring; exact obstacle intersections remain active"
+                ),
+            },
+            "signed_score_exemptions": {
+                "vertex_indices": self.signed_exempt_vertex_indices.tolist(),
+                "face_indices": self.signed_exempt_face_indices.tolist(),
             },
             "outside_vertex_indices": self.outside_vertex_indices.tolist(),
             "outside_face_indices": self.outside_face_indices.tolist(),
@@ -1100,12 +1110,31 @@ class CavityEvaluator:
         return clearances, faces, boundary_points
 
     def signed_clearances(
-        self, fitted_foot: TriangleMesh
+        self,
+        fitted_foot: TriangleMesh,
+        signed_exempt_vertex_indices: np.ndarray | None = None,
+        signed_exempt_face_indices: np.ndarray | None = None,
     ) -> SignedCavityClearance:
         """Measure local upper and side clearance without closing openings."""
 
         face_triangles = fitted_foot.vertices[fitted_foot.faces]
         face_centroids = face_triangles.mean(axis=1)
+        exempt_vertices = _validate_indices(
+            np.empty(0, dtype=np.int64)
+            if signed_exempt_vertex_indices is None
+            else signed_exempt_vertex_indices,
+            len(fitted_foot.vertices),
+            "signed_exempt_vertex_indices",
+            allow_empty=True,
+        )
+        exempt_faces = _validate_indices(
+            np.empty(0, dtype=np.int64)
+            if signed_exempt_face_indices is None
+            else signed_exempt_face_indices,
+            len(fitted_foot.faces),
+            "signed_exempt_face_indices",
+            allow_empty=True,
+        )
         vertex_upper, vertex_upper_faces, vertex_upper_points = (
             self._upper_clearances(fitted_foot.vertices)
         )
@@ -1122,6 +1151,8 @@ class CavityEvaluator:
             vertex_upper, vertex_side
         )
         face_combined = _combine_signed_clearances(face_upper, face_side)
+        vertex_combined[exempt_vertices] = np.nan
+        face_combined[exempt_faces] = np.nan
 
         corner_values = vertex_combined[fitted_foot.faces]
         samples = np.concatenate((face_combined[:, None], corner_values), axis=1)
@@ -1162,6 +1193,8 @@ class CavityEvaluator:
             face_side_faces=face_side_faces,
             face_side_points=face_side_points,
             face_combined_clearances=face_combined,
+            signed_exempt_vertex_indices=exempt_vertices,
+            signed_exempt_face_indices=exempt_faces,
             outside_vertex_indices=outside_vertices,
             outside_face_indices=outside_faces,
             outside_area=outside_area,
@@ -1269,6 +1302,8 @@ class CavityEvaluator:
         fitted_foot: TriangleMesh,
         plantar_vertex_indices: np.ndarray,
         plantar_face_indices: np.ndarray,
+        signed_exempt_vertex_indices: np.ndarray | None = None,
+        signed_exempt_face_indices: np.ndarray | None = None,
     ) -> CavityAnalysis:
         """Run the complete Checkpoint 6 analysis for one fitted candidate."""
 
@@ -1315,7 +1350,11 @@ class CavityEvaluator:
                 self.numerical_tolerance,
             ),
         }
-        signed = self.signed_clearances(fitted_foot)
+        signed = self.signed_clearances(
+            fitted_foot,
+            signed_exempt_vertex_indices,
+            signed_exempt_face_indices,
+        )
         return CavityAnalysis(
             numerical_tolerance=self.numerical_tolerance,
             footbed_source_face_indices=self.footbed_source_face_indices,

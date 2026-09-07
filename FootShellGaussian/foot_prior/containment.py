@@ -32,7 +32,7 @@ from .supr_foot import (
 MAX_BETA_ABS = 3.0
 MAX_PITCH_CHANGE_DEGREES = 4.0
 MAX_JOINT_ITERATIONS = 8
-MAX_RESTARTS = 6
+MAX_RESTARTS = 10
 
 # SUPR shape, rather than a second uniform scale, controls the fitted size.
 # The accepted interval is deliberately wider than a single target because the
@@ -43,7 +43,9 @@ MAX_TARGET_TOE_ALLOWANCE_MM = 22.0
 BETA_AXIS_MAGNITUDES = (1.0, 2.0)
 BETA_COUPLED_MAGNITUDES = (0.75, 1.5)
 BETA0_SOLVE_ITERATIONS = 10
-BROAD_EXACT_SHORTLIST_SIZE = 32
+LATIN_HYPERCUBE_SAMPLE_COUNT = 256
+LATIN_HYPERCUBE_SEED = 0
+BETA0_TARGET_ALLOWANCES_MM = (18.0, 20.0, 22.0)
 JACOBIAN_BETA_STEP = 0.05
 JACOBIAN_PITCH_STEP_DEGREES = 0.1
 JACOBIAN_OFFSET_STEP_CELLS = 0.1
@@ -223,20 +225,6 @@ class _ScoredCandidate:
         value = self.signed.protrusion_statistics["maximum_protrusion_depth"]
         return float(value or 0.0)
 
-    def screen_rank_key(self) -> tuple[Any, ...]:
-        """Rank broad candidates before paying for exact intersections."""
-
-        return (
-            0 if self.in_target_band else 1,
-            self.target_band_distance,
-            self.outside_area_tier,
-            self.signed.protrusion_energy,
-            abs(self.placement.toe_allowance_mm - TARGET_TOE_ALLOWANCE_MM),
-            self.beta_l2_norm,
-            self.placement_deviation,
-            self.parameters.cache_key(),
-        )
-
     def rank_key(self) -> tuple[Any, ...]:
         """Order exact candidates, requiring realistic size before containment."""
 
@@ -252,10 +240,10 @@ class _ScoredCandidate:
             0 if self.contained else 1,
             self.affected_area_tier,
             self.collision_area_tier,
+            self.collision_area_fraction,
             self.outside_area_tier,
             self.maximum_protrusion,
             self.signed.protrusion_energy,
-            self.collision_area_fraction,
             abs(self.placement.toe_allowance_mm - TARGET_TOE_ALLOWANCE_MM),
             self.beta_l2_norm,
             self.placement_deviation,
@@ -276,6 +264,12 @@ class _ScoredCandidate:
             "outside_area": self.signed.outside_area,
             "outside_area_fraction": self.signed.outside_area_fraction,
             "outside_area_tier": self.outside_area_tier,
+            "signed_score_exempt_vertex_count": int(
+                len(self.signed.signed_exempt_vertex_indices)
+            ),
+            "signed_score_exempt_face_count": int(
+                len(self.signed.signed_exempt_face_indices)
+            ),
             "maximum_protrusion_depth": self.maximum_protrusion,
             "protrusion_energy": self.signed.protrusion_energy,
             "beta_l2_norm": self.beta_l2_norm,
@@ -433,6 +427,33 @@ class ContainmentFootFit:
         }
 
 
+def _ankle_signed_exemptions(
+    placement: SupportPlacementCandidate,
+    foot_faces: np.ndarray,
+    tolerance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Identify the anatomical exit region omitted from signed scoring only."""
+
+    if len(placement.posed_joints) <= 2:
+        raise ValueError("SUPR placement must contain ankle and midfoot joints")
+    aligned_joints = transform_points(placement.posed_joints, placement.transform)
+    ankle = aligned_joints[1]
+    midfoot = aligned_joints[2]
+    vertices = placement.aligned_vertices
+
+    # Shoe +Y points downward. A smaller Y is therefore above the ankle.
+    vertex_mask = (
+        (vertices[:, 1] < ankle[1] - tolerance)
+        & (vertices[:, 0] <= midfoot[0] + tolerance)
+    )
+    exempt_vertices = np.flatnonzero(vertex_mask).astype(np.int64)
+    faces = np.asarray(foot_faces, dtype=np.int64)
+    exempt_faces = np.flatnonzero(np.all(vertex_mask[faces], axis=1)).astype(
+        np.int64
+    )
+    return exempt_vertices, exempt_faces
+
+
 class _Search:
     """Screen broad SUPR shapes, then refine a few exact candidates."""
 
@@ -571,7 +592,16 @@ class _Search:
                     self.rejections[rejection] = self.rejections.get(rejection, 0) + 1
                     continue
                 mesh = TriangleMesh(placement.aligned_vertices, self.neutral_foot.faces)
-                signed = self.cavity.signed_clearances(mesh)
+                exempt_vertices, exempt_faces = _ankle_signed_exemptions(
+                    placement,
+                    self.neutral_foot.faces,
+                    self.cavity.numerical_tolerance,
+                )
+                signed = self.cavity.signed_clearances(
+                    mesh,
+                    exempt_vertices,
+                    exempt_faces,
+                )
                 outside_tier = int(
                     np.ceil(signed.outside_area_fraction / self.area_equivalence_fraction - 1e-12)
                 ) if len(signed.outside_face_indices) else 0
@@ -952,6 +982,12 @@ def _cavity_summary(analysis: CavityAnalysis) -> dict[str, Any]:
         },
         "unsigned_clearance_summaries": analysis.clearance_summaries,
         "signed_clearance": {
+            "score_exempt_vertex_indices": (
+                analysis.signed_clearance.signed_exempt_vertex_indices.tolist()
+            ),
+            "score_exempt_face_indices": (
+                analysis.signed_clearance.signed_exempt_face_indices.tolist()
+            ),
             "outside_area_fraction": analysis.signed_clearance.outside_area_fraction,
             "protrusion_energy": analysis.signed_clearance.protrusion_energy,
             "protrusion_statistics": analysis.signed_clearance.protrusion_statistics,
@@ -1043,18 +1079,42 @@ def _posed_length_ratios(
     return search.context.length_scale * np.ptp(vertices[:, :, 2], axis=1)
 
 
-def _broad_starts(search: _Search, initial: _Parameters) -> list[_Parameters]:
-    """Create broad shapes and solve beta 0 toward 20 mm in GPU batches."""
+def _latin_hypercube_beta_templates(initial: _Parameters) -> np.ndarray:
+    """Return deterministic, independently stratified beta 1--9 shapes."""
 
-    templates, direct = _beta_templates(initial)
+    rng = np.random.default_rng(LATIN_HYPERCUBE_SEED)
+    unit = np.empty((LATIN_HYPERCUBE_SAMPLE_COUNT, 9), dtype=np.float64)
+    for dimension in range(9):
+        strata = rng.permutation(LATIN_HYPERCUBE_SAMPLE_COUNT)
+        unit[:, dimension] = (
+            strata + rng.random(LATIN_HYPERCUBE_SAMPLE_COUNT)
+        ) / LATIN_HYPERCUBE_SAMPLE_COUNT
+    result = np.repeat(
+        initial.betas[None, :], LATIN_HYPERCUBE_SAMPLE_COUNT, axis=0
+    )
+    result[:, 1:] = -MAX_BETA_ABS + 2.0 * MAX_BETA_ABS * unit
+    return result
+
+
+def _solve_beta0_for_length(
+    search: _Search,
+    templates: np.ndarray,
+    target_length_ratio: float,
+) -> np.ndarray:
+    """Solve beta 0 in parallel without changing the fixed SUPR scale."""
+
     template_array = np.asarray(templates, dtype=np.float64)
+    if template_array.ndim != 2 or template_array.shape[1] != 10:
+        raise ValueError("beta templates must have shape (N, 10)")
+    if not len(template_array):
+        return template_array.copy()
     lower = template_array.copy()
     upper = template_array.copy()
     lower[:, 0] = -MAX_BETA_ABS
     upper[:, 0] = MAX_BETA_ABS
     lower_ratio = _posed_length_ratios(search, lower)
     upper_ratio = _posed_length_ratios(search, upper)
-    target = TARGET_TOE_X
+    target = float(target_length_ratio)
     bracketed = (lower_ratio - target) * (upper_ratio - target) <= 0.0
 
     for _ in range(BETA0_SOLVE_ITERATIONS):
@@ -1071,59 +1131,32 @@ def _broad_starts(search: _Search, initial: _Parameters) -> list[_Parameters]:
     candidates = np.stack((lower, upper), axis=1)
     ratios = np.stack((lower_ratio, upper_ratio), axis=1)
     closest = np.argmin(np.abs(ratios - target), axis=1)
-    solved = candidates[np.arange(len(candidates)), closest]
-    shapes = [*direct, *solved]
+    return candidates[np.arange(len(candidates)), closest]
+
+
+def _broad_starts(search: _Search, initial: _Parameters) -> list[_Parameters]:
+    """Keep legacy starts and add varied-magnitude ten-beta shapes."""
+
+    legacy_templates, legacy_direct = _beta_templates(initial)
+    legacy_solved = _solve_beta0_for_length(
+        search,
+        np.asarray(legacy_templates, dtype=np.float64),
+        TARGET_TOE_X,
+    )
+    latin_templates = _latin_hypercube_beta_templates(initial)
+    latin_solved: list[np.ndarray] = []
+    for allowance in BETA0_TARGET_ALLOWANCES_MM:
+        latin_solved.extend(
+            _solve_beta0_for_length(
+                search,
+                latin_templates,
+                toe_allowance_to_foot_length_ratio(allowance),
+            )
+        )
+    shapes = [*legacy_direct, *legacy_solved, *latin_solved]
     return _deduplicate_parameters(
         [replace(initial, betas=np.asarray(shape).copy()) for shape in shapes]
     )
-
-
-def _broad_exact_shortlist(
-    candidates: list[_ScoredCandidate], limit: int
-) -> list[_ScoredCandidate]:
-    """Retain differently useful broad shapes before exact intersection work."""
-
-    target = [candidate for candidate in candidates if candidate.in_target_band]
-    if not target:
-        raise ValueError(
-            "SUPR could not produce a support-valid foot with 18-22 mm toe space"
-        )
-    orders = (
-        lambda item: item.screen_rank_key(),
-        lambda item: (
-            item.outside_area_tier,
-            item.signed.protrusion_energy,
-            item.beta_l2_norm,
-            item.parameters.cache_key(),
-        ),
-        lambda item: (
-            abs(item.placement.toe_allowance_mm - TARGET_TOE_ALLOWANCE_MM),
-            item.beta_l2_norm,
-            item.parameters.cache_key(),
-        ),
-        lambda item: (
-            item.beta_l2_norm,
-            item.outside_area_tier,
-            item.parameters.cache_key(),
-        ),
-    )
-    chosen: list[_ScoredCandidate] = []
-    seen: set[tuple[float, ...]] = set()
-    per_order = max(1, limit // len(orders))
-    for order in orders:
-        for candidate in sorted(target, key=order)[:per_order]:
-            key = candidate.parameters.cache_key()
-            if key not in seen:
-                seen.add(key)
-                chosen.append(candidate)
-    for candidate in sorted(target, key=lambda item: item.screen_rank_key()):
-        if len(chosen) >= limit:
-            break
-        key = candidate.parameters.cache_key()
-        if key not in seen:
-            seen.add(key)
-            chosen.append(candidate)
-    return chosen
 
 
 def _restart_candidates(
@@ -1245,20 +1278,35 @@ def build_containment_foot_fit(
         key = candidate.parameters.cache_key()
         if key not in full_analysis_cache:
             mesh = TriangleMesh(candidate.placement.aligned_vertices, context.faces)
+            exempt_vertices, exempt_faces = _ankle_signed_exemptions(
+                candidate.placement,
+                context.faces,
+                cavity.numerical_tolerance,
+            )
             full_analysis_cache[key] = cavity.analyze(
                 mesh,
                 context.regions.plantar_vertex_indices,
                 context.regions.plantar_face_indices,
+                exempt_vertices,
+                exempt_faces,
             )
         return full_analysis_cache[key]
 
+    baseline_screened = search.screen([initial])
+    if not baseline_screened:
+        raise ValueError("Checkpoint 5 parameters no longer pass support placement")
+    corrected_baseline = baseline_screened[0]
     broad_starts = _broad_starts(search, initial)
     broad_screened = search.screen(broad_starts)
-    broad_shortlist = _broad_exact_shortlist(
-        broad_screened, BROAD_EXACT_SHORTLIST_SIZE
-    )
+    broad_target = [
+        candidate for candidate in broad_screened if candidate.in_target_band
+    ]
+    if not broad_target:
+        raise ValueError(
+            "SUPR could not produce a support-valid foot with 18-22 mm toe space"
+        )
     broad_exact = search.evaluate(
-        [candidate.parameters for candidate in broad_shortlist]
+        [candidate.parameters for candidate in broad_target]
     )
     if not broad_exact:
         raise ValueError("no broad SUPR candidate passed exact evaluation")
@@ -1273,17 +1321,7 @@ def build_containment_foot_fit(
         baseline_analysis.collision_pairs,
         search.area_equivalence_fraction,
     )
-    baseline_outside_tier = (
-        int(
-            np.ceil(
-                baseline_analysis.signed_clearance.outside_area_fraction
-                / search.area_equivalence_fraction
-                - 1e-12
-            )
-        )
-        if len(baseline_analysis.signed_clearance.outside_face_indices)
-        else 0
-    )
+    baseline_outside_tier = corrected_baseline.outside_area_tier
     exact_by_key = {
         candidate.parameters.cache_key(): candidate
         for candidate in [*broad_exact, *refined]
@@ -1326,10 +1364,20 @@ def build_containment_foot_fit(
         "broad_search": {
             "generated_start_count": len(broad_starts),
             "valid_screened_count": len(broad_screened),
-            "exact_shortlist_count": len(broad_exact),
+            "target_band_screened_count": len(broad_target),
+            "exact_candidate_count": len(broad_exact),
             "restart_count": len(restarts),
             "individual_beta_magnitudes": list(BETA_AXIS_MAGNITUDES),
             "coupled_beta_magnitudes": list(BETA_COUPLED_MAGNITUDES),
+            "latin_hypercube": {
+                "sample_count": LATIN_HYPERCUBE_SAMPLE_COUNT,
+                "random_seed": LATIN_HYPERCUBE_SEED,
+                "dimensions": "betas_1_through_9",
+                "range": [-MAX_BETA_ABS, MAX_BETA_ABS],
+                "beta0_target_toe_allowances_mm": list(
+                    BETA0_TARGET_ALLOWANCES_MM
+                ),
+            },
             "beta0_target_solve_iterations": BETA0_SOLVE_ITERATIONS,
             "restart_candidates": [candidate.summary() for candidate in restarts],
             "refined_candidates": [candidate.summary() for candidate in refined],
@@ -1362,6 +1410,12 @@ def build_containment_foot_fit(
         "baseline_no_regression": {
             "maximum_collision_area_tier": baseline_score["collision_area_tier"],
             "maximum_signed_outside_area_tier": baseline_outside_tier,
+            "signed_score_exempt_vertex_count": int(
+                len(corrected_baseline.signed.signed_exempt_vertex_indices)
+            ),
+            "signed_score_exempt_face_count": int(
+                len(corrected_baseline.signed.signed_exempt_face_indices)
+            ),
         },
         "baseline": _cavity_summary(baseline_analysis),
         "selected": selected.summary(),

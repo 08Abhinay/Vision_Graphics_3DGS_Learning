@@ -226,7 +226,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     overlay = _make_overlay(shoe, final_foot, colors)
     plain_colors = np.tile(FOOT_COLOR, (len(final_foot.vertices), 1))
     payload: dict[str, Any] = {
-        "schema_version": 4,
+        "schema_version": 5,
         "shoe_profile": NORMAL_SHOE_PROFILE,
         "inputs": {
             "preparation_directory": str(preparation_dir),
