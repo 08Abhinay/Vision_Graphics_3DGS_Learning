@@ -11,10 +11,12 @@ from typing import Any
 import numpy as np
 
 from foot_prior.alignment import transform_points
+from foot_prior.alignment import identify_supr_contact_regions
 from foot_prior.containment import build_containment_foot_fit
 from foot_prior.mesh import TriangleMesh, save_triangle_mesh
 from foot_prior.normalization import NORMAL_SHOE_PROFILE
 from foot_prior.supr_foot import (
+    build_supr_mesh_subdivision,
     load_neutral_supr_foot,
     load_posable_supr_foot,
 )
@@ -47,6 +49,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cavity-analysis-dir", required=True, type=Path)
     parser.add_argument("--supr-model", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--subdivision-levels",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help=(
+            "Deterministically subdivide every SUPR candidate before support "
+            "and containment scoring; 0 preserves the native topology."
+        ),
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -179,6 +191,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     pose, betas = _reproduce_support_fit(
         supr_model, support_fit, fitted_foot
     )
+    subdivision = build_supr_mesh_subdivision(
+        supr_model.faces,
+        len(neutral_foot.vertices),
+        args.subdivision_levels,
+    )
 
     normalization = preparation.get("normalization")
     if not isinstance(normalization, dict):
@@ -217,9 +234,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         baseline_fitted_foot=fitted_foot,
         expected_baseline_collision_pairs=stored_pairs,
         expected_baseline_status=cavity_record.get("status"),
+        cavity_subdivision=(
+            subdivision if subdivision.levels > 0 else None
+        ),
     )
 
-    final_foot = TriangleMesh(result.aligned_vertices, neutral_foot.faces)
+    final_foot = TriangleMesh(result.aligned_vertices, result.foot_faces)
     colors = result.final_cavity.foot_vertex_colors(
         final_foot, grid_spacing
     )
@@ -243,7 +263,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "support_fit": support_fit["schema_version"],
             "cavity_analysis": cavity_record["schema_version"],
         },
-        "contact_regions": support_fit["contact_regions"],
+        "contact_regions": identify_supr_contact_regions(
+            subdivision.apply_mesh(neutral_foot)
+        ).to_dict(),
+        "supr_topology": subdivision.to_dict(),
         "support_grid_cell_spacing": grid_spacing,
         **result.to_dict(),
     }

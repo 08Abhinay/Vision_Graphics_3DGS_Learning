@@ -17,6 +17,7 @@ from .alignment import (
     _triangle_geometry,
     build_support_placement_context,
     evaluate_support_placement,
+    identify_supr_contact_regions,
     toe_allowance_to_foot_length_ratio,
     transform_points,
 )
@@ -25,6 +26,7 @@ from .mesh import TriangleMesh
 from .supr_foot import (
     SUPR_ANKLE_PITCH_INDEX,
     SUPR_MIDFOOT_PITCH_INDEX,
+    SuprMeshSubdivision,
     SuprFootModel,
 )
 
@@ -300,6 +302,7 @@ class ContainmentFootFit:
 
     pose_parameters: np.ndarray
     betas: np.ndarray
+    foot_faces: np.ndarray
     posed_vertices: np.ndarray
     posed_joints: np.ndarray
     aligned_vertices: np.ndarray
@@ -465,6 +468,7 @@ class _Search:
         cavity: CavityEvaluator,
         initial: _Parameters,
         grid_spacing: float,
+        cavity_subdivision: SuprMeshSubdivision | None = None,
     ) -> None:
         self.supr_model = supr_model
         self.neutral_foot = neutral_foot
@@ -472,14 +476,51 @@ class _Search:
         self.cavity = cavity
         self.initial = initial
         self.grid_spacing = grid_spacing
+        self.cavity_subdivision = cavity_subdivision
+        if cavity_subdivision is None:
+            self.cavity_faces = context.faces
+            self.cavity_regions = context.regions
+            cavity_neutral = neutral_foot
+        else:
+            cavity_neutral = cavity_subdivision.apply_mesh(neutral_foot)
+            self.cavity_faces = cavity_subdivision.faces
+            self.cavity_regions = identify_supr_contact_regions(cavity_neutral)
+        _, cavity_areas = _triangle_geometry(
+            cavity_neutral.vertices, self.cavity_faces
+        )
         self.area_equivalence_fraction = float(
-            np.median(context.neutral_areas) / np.sum(context.neutral_areas)
+            np.median(cavity_areas) / np.sum(cavity_areas)
         )
         self.cache: dict[tuple[float, ...], _ScoredCandidate | str] = {}
         self.shape_reference_cache: dict[tuple[float, ...], tuple[np.ndarray, np.ndarray]] = {}
         self.rejections: dict[str, int] = {}
         self.history: list[dict[str, Any]] = []
         self.exact_evaluation_count = 0
+
+    def cavity_mesh(self, vertices: np.ndarray) -> TriangleMesh:
+        """Return the topology used for signed and exact containment scoring."""
+
+        values = np.asarray(vertices, dtype=np.float64)
+        if self.cavity_subdivision is not None:
+            values = self.cavity_subdivision.apply_vertices(values)
+        return TriangleMesh(values, self.cavity_faces)
+
+    def cavity_placement(
+        self, placement: SupportPlacementCandidate
+    ) -> SupportPlacementCandidate:
+        """Expose dense candidate vertices while retaining its rigid transform."""
+
+        if self.cavity_subdivision is None:
+            return placement
+        return replace(
+            placement,
+            posed_vertices=self.cavity_subdivision.apply_vertices(
+                placement.posed_vertices
+            ),
+            aligned_vertices=self.cavity_subdivision.apply_vertices(
+                placement.aligned_vertices
+            ),
+        )
 
     def _shape_references(
         self, shapes: np.ndarray
@@ -591,10 +632,11 @@ class _Search:
                     self.cache[key] = rejection
                     self.rejections[rejection] = self.rejections.get(rejection, 0) + 1
                     continue
-                mesh = TriangleMesh(placement.aligned_vertices, self.neutral_foot.faces)
+                cavity_placement = self.cavity_placement(placement)
+                mesh = self.cavity_mesh(placement.aligned_vertices)
                 exempt_vertices, exempt_faces = _ankle_signed_exemptions(
-                    placement,
-                    self.neutral_foot.faces,
+                    cavity_placement,
+                    self.cavity_faces,
                     self.cavity.numerical_tolerance,
                 )
                 signed = self.cavity.signed_clearances(
@@ -625,7 +667,7 @@ class _Search:
     ) -> _ScoredCandidate | None:
         if candidate.exact_evaluated:
             return candidate
-        mesh = TriangleMesh(candidate.placement.aligned_vertices, self.neutral_foot.faces)
+        mesh = self.cavity_mesh(candidate.placement.aligned_vertices)
         pairs, ignored = self.cavity.collision_pairs(mesh)
         if len(ignored):
             key = candidate.parameters.cache_key()
@@ -1200,6 +1242,7 @@ def build_containment_foot_fit(
     baseline_fitted_foot: TriangleMesh,
     expected_baseline_collision_pairs: np.ndarray | None = None,
     expected_baseline_status: str | None = None,
+    cavity_subdivision: SuprMeshSubdivision | None = None,
 ) -> ContainmentFootFit:
     """Find the largest support-valid SUPR foot contained by local boundaries.
 
@@ -1256,7 +1299,7 @@ def build_containment_foot_fit(
         baseline_fitted_foot,
         normalized_centerline_xz,
     )
-    baseline_analysis = cavity.analyze(
+    source_baseline_analysis = cavity.analyze(
         baseline_fitted_foot,
         context.regions.plantar_vertex_indices,
         context.regions.plantar_face_indices,
@@ -1264,29 +1307,51 @@ def build_containment_foot_fit(
     if expected_baseline_collision_pairs is not None:
         expected = np.asarray(expected_baseline_collision_pairs, dtype=np.int64)
         expected = expected.reshape(-1, 2) if expected.size else np.empty((0, 2), dtype=np.int64)
-        if not np.array_equal(baseline_analysis.collision_pairs, expected):
+        if not np.array_equal(source_baseline_analysis.collision_pairs, expected):
             raise ValueError(
                 "stored Checkpoint 5 mesh does not reproduce the Checkpoint 6 collision pairs"
             )
-    if expected_baseline_status is not None and baseline_analysis.status != expected_baseline_status:
+    if (
+        expected_baseline_status is not None
+        and source_baseline_analysis.status != expected_baseline_status
+    ):
         raise ValueError("stored Checkpoint 5 mesh does not reproduce the Checkpoint 6 status")
 
-    search = _Search(supr_model, neutral_foot_mesh, context, cavity, initial, grid_spacing)
+    search = _Search(
+        supr_model,
+        neutral_foot_mesh,
+        context,
+        cavity,
+        initial,
+        grid_spacing,
+        cavity_subdivision,
+    )
+    if cavity_subdivision is None:
+        baseline_analysis = source_baseline_analysis
+        baseline_scoring_mesh = baseline_fitted_foot
+    else:
+        baseline_scoring_mesh = search.cavity_mesh(baseline_fitted_foot.vertices)
+        baseline_analysis = cavity.analyze(
+            baseline_scoring_mesh,
+            search.cavity_regions.plantar_vertex_indices,
+            search.cavity_regions.plantar_face_indices,
+        )
     full_analysis_cache: dict[tuple[float, ...], CavityAnalysis] = {}
 
     def full_analysis(candidate: _ScoredCandidate) -> CavityAnalysis:
         key = candidate.parameters.cache_key()
         if key not in full_analysis_cache:
-            mesh = TriangleMesh(candidate.placement.aligned_vertices, context.faces)
+            cavity_placement = search.cavity_placement(candidate.placement)
+            mesh = search.cavity_mesh(candidate.placement.aligned_vertices)
             exempt_vertices, exempt_faces = _ankle_signed_exemptions(
-                candidate.placement,
-                context.faces,
+                cavity_placement,
+                search.cavity_faces,
                 cavity.numerical_tolerance,
             )
             full_analysis_cache[key] = cavity.analyze(
                 mesh,
-                context.regions.plantar_vertex_indices,
-                context.regions.plantar_face_indices,
+                search.cavity_regions.plantar_vertex_indices,
+                search.cavity_regions.plantar_face_indices,
                 exempt_vertices,
                 exempt_faces,
             )
@@ -1317,7 +1382,7 @@ def build_containment_foot_fit(
     ]
 
     baseline_score = _collision_score_from_pairs(
-        baseline_fitted_foot,
+        baseline_scoring_mesh,
         baseline_analysis.collision_pairs,
         search.area_equivalence_fraction,
     )
@@ -1421,12 +1486,14 @@ def build_containment_foot_fit(
         "selected": selected.summary(),
         "history": search.history,
     }
+    selected_cavity_placement = search.cavity_placement(selected.placement)
     return ContainmentFootFit(
         pose_parameters=selected.placement.pose,
         betas=selected.parameters.betas,
-        posed_vertices=selected.placement.posed_vertices,
+        foot_faces=search.cavity_faces,
+        posed_vertices=selected_cavity_placement.posed_vertices,
         posed_joints=selected.placement.posed_joints,
-        aligned_vertices=selected.placement.aligned_vertices,
+        aligned_vertices=selected_cavity_placement.aligned_vertices,
         aligned_joints=aligned_joints,
         posed_supr_to_normalized_shoe=posed_to_normalized,
         normalized_shoe_to_posed_supr=normalized_to_posed,
