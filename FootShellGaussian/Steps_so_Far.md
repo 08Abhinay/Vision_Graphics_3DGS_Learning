@@ -24,6 +24,8 @@ normal
   -> write footbed review and normalized-shoe artifacts
   -> fit SUPR ankle and midfoot pitch against the saved normalized support
   -> measure footbed contact and clearance from every other shoe surface
+  -> fit SUPR shape and placement to the measured cavity
+  -> transfer canonical anatomy to one shared dense SUPR surface
 
 high_heel
   -> detect the inclined interior support
@@ -61,6 +63,12 @@ Normal-shoe SUPR support fits:
 
 Normal-shoe cavity analyses:
 /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis
+
+Final native normal-shoe containment fits:
+/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit
+
+Canonical and dense anatomical surfaces:
+/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface
 ```
 
 The manifest and processed dataset paths remain stable as shoes are added. Do
@@ -520,8 +528,8 @@ cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
 
 /home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
   scripts/run_cavity_analysis.py \
-  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/canvas_shoe \
-  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_2/canvas_shoe \
+  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation/canvas_shoe \
+  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit/canvas_shoe \
   --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis/canvas_shoe
 ```
 
@@ -553,11 +561,11 @@ outputs:
 ```bash
 cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
 
-for shoe_dir in /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_2/*; do
+for shoe_dir in /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit/*; do
   shoe=$(basename "$shoe_dir")
   /home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
     scripts/run_cavity_analysis.py \
-    --preparation-dir "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/$shoe" \
+    --preparation-dir "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation/$shoe" \
     --support-fit-dir "$shoe_dir" \
     --output-dir "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis/$shoe"
 done
@@ -580,11 +588,11 @@ cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
 CUDA_VISIBLE_DEVICES=1 \
 /home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
   scripts/run_containment_fit.py \
-  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/crocs \
-  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_anchored/crocs \
-  --cavity-analysis-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis_anchored/crocs \
+  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation/crocs \
+  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit/crocs \
+  --cavity-analysis-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis/crocs \
   --supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male_right_foot.npy \
-  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit_beta_expanded_search/crocs
+  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit/crocs
 ```
 
 The command writes:
@@ -613,7 +621,7 @@ rescaled afterward. The final mesh must leave 18–22 mm in front, with 20 mm as
 the target.
 
 Open `containment_fit_overlay.ply` and load the existing green
-`footbed_normalized.ply` from the matching `support_fit_anchored` directory. Confirm
+`footbed_normalized.ply` from the matching `support_fit` directory. Confirm
 that the foot remains anatomical and supported. Blue is clear, yellow is near
 an obstacle, magenta is beyond a local boundary, and red is an exact forbidden
 collision.
@@ -640,6 +648,49 @@ protrusion faces.
 Use `--overwrite` only when deliberately replacing these four known artifacts.
 CUDA generates SUPR candidates; exact shoe collision checks run on the CPU.
 
+## Step 14: Build canonical and dense anatomical surfaces
+
+This CPU-only step starts from the accepted native fitted feet in
+`containment_fit`. It does not run fitting again. It defines anatomy once on
+the neutral right SUPR reference and transfers it to every fitted foot through
+the stable SUPR vertex and face correspondence. It then applies the same
+deterministic subdiv2 map to every surface.
+
+```bash
+cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
+
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_anatomical_surface.py \
+  --containment-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit \
+  --supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male_right_foot.npy \
+  --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
+  --overwrite
+```
+
+With no names after the options, all valid normal-shoe containment directories
+are processed in sorted order. To rerun only a few shoes, append their names:
+
+```bash
+  canvas_shoe sandal_1 sneaker_vibe ww_ii_german_jack_boots
+```
+
+The shared reference directory contains the canonical JSON/NPZ, neutral dense
+mesh, and two colored anatomical maps. Every shoe directory contains:
+
+```text
+anatomical_surface.json
+foot_dense.ply
+regions_longitudinal.ply
+regions_surface.ply
+```
+
+Inspect `regions_longitudinal.ply` to confirm that ankle, heel, arch, forefoot,
+and toe colors remain on the same anatomy. Inspect `regions_surface.ply` for
+plantar, top, medial, lateral, rear, and front surface colors. The dense mesh
+must always contain 4,151 vertices and 8,240 faces, with the first 266 vertices
+identical to the accepted native fitted foot. `--overwrite` replaces only the
+known artifacts and preserves unrelated files.
+
 ## Failure rules
 
 - If audit orientation is wrong, fix the manifest and rerun the audit.
@@ -654,7 +705,8 @@ CUDA generates SUPR candidates; exact shoe collision checks run on the CPU.
 
 ## What comes next
 
-The current normal-shoe endpoint is collision-aware containment fitting. The
-next checkpoint may use toe articulation and other localized SUPR controls for
-red areas that cannot be resolved by global shape and small rigid placement
-changes. High-heel SUPR fitting is intentionally outside the current scope.
+The current normal-shoe endpoint is the canonical, shared dense anatomical
+surface. The next anatomical checkpoint can extend this surface boundary with
+an outward coordinate `r` to form a volumetric anatomical domain. Toe
+articulation and other localized controls remain optional future containment
+work. High-heel SUPR fitting remains outside the current scope.

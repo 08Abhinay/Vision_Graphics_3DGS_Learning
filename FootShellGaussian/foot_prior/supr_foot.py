@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -96,8 +97,12 @@ class SuprMeshSubdivision:
     levels: int
     source_vertex_count: int
     source_face_count: int
+    source_faces: np.ndarray
     edge_steps: tuple[np.ndarray, ...]
     faces: np.ndarray
+    vertex_source_indices: np.ndarray
+    vertex_source_weights: np.ndarray
+    face_parent_indices: np.ndarray
 
     @property
     def vertex_count(self) -> int:
@@ -132,9 +137,17 @@ class SuprMeshSubdivision:
 
         if len(mesh.vertices) != self.source_vertex_count:
             raise ValueError("mesh vertex count does not match subdivision source")
-        if len(mesh.faces) != self.source_face_count:
-            raise ValueError("mesh face count does not match subdivision source")
+        if (
+            len(mesh.faces) != self.source_face_count
+            or not np.array_equal(mesh.faces, self.source_faces)
+        ):
+            raise ValueError("mesh topology does not match subdivision source")
         return TriangleMesh(self.apply_vertices(mesh.vertices), self.faces)
+
+    @property
+    def topology_digest(self) -> str:
+        values = np.ascontiguousarray(self.faces, dtype="<i8")
+        return hashlib.sha256(values.tobytes()).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +157,7 @@ class SuprMeshSubdivision:
             "source_face_count": self.source_face_count,
             "vertex_count": self.vertex_count,
             "face_count": int(len(self.faces)),
+            "topology_sha256": self.topology_digest,
             "surface_geometry": (
                 "piecewise-linear source surface is unchanged; subdivision "
                 "adds deterministic support and collision samples"
@@ -159,7 +173,7 @@ class SubdividedSuprFootModel:
         source_model: SuprFootModel,
         subdivision: SuprMeshSubdivision,
     ) -> None:
-        if len(source_model.faces) != subdivision.source_face_count:
+        if not np.array_equal(source_model.faces, subdivision.source_faces):
             raise ValueError("SUPR model faces do not match subdivision source")
         self._source_model = source_model
         self.subdivision = subdivision
@@ -196,6 +210,10 @@ def build_supr_mesh_subdivision(
     current_faces = source_faces.copy()
     current_vertex_count = count
     steps: list[np.ndarray] = []
+    contributors: list[dict[int, float]] = [
+        {index: 1.0} for index in range(count)
+    ]
+    face_parents = np.arange(len(source_faces), dtype=np.int64)
     for _ in range(level_count):
         edges = np.sort(
             np.concatenate(
@@ -213,6 +231,13 @@ def build_supr_mesh_subdivision(
             (int(edge[0]), int(edge[1])): current_vertex_count + index
             for index, edge in enumerate(edges)
         }
+        for first, second in edges:
+            combined: dict[int, float] = {}
+            for source, weight in contributors[int(first)].items():
+                combined[source] = combined.get(source, 0.0) + 0.5 * weight
+            for source, weight in contributors[int(second)].items():
+                combined[source] = combined.get(source, 0.0) + 0.5 * weight
+            contributors.append(combined)
 
         a, b, c = current_faces.T
         ab = np.asarray(
@@ -236,15 +261,30 @@ def build_supr_mesh_subdivision(
             ),
             axis=0,
         )
+        face_parents = np.tile(face_parents, 4)
         steps.append(edges)
         current_vertex_count += len(edges)
+
+    source_indices = np.full((current_vertex_count, 3), -1, dtype=np.int64)
+    source_weights = np.zeros((current_vertex_count, 3), dtype=np.float64)
+    for vertex_index, values in enumerate(contributors):
+        ordered = sorted(values.items())
+        if len(ordered) > 3:
+            raise RuntimeError("subdivision vertex depends on more than one source face")
+        for slot, (source_index, weight) in enumerate(ordered):
+            source_indices[vertex_index, slot] = source_index
+            source_weights[vertex_index, slot] = weight
 
     return SuprMeshSubdivision(
         levels=level_count,
         source_vertex_count=count,
         source_face_count=len(source_faces),
+        source_faces=source_faces.copy(),
         edge_steps=tuple(steps),
         faces=current_faces,
+        vertex_source_indices=source_indices,
+        vertex_source_weights=source_weights,
+        face_parent_indices=face_parents,
     )
 
 

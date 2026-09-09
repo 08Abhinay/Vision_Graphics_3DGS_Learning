@@ -14,6 +14,10 @@ representative foot with realistic front clearance without losing plantar suppor
 searched separately: a single anchored scale carries each candidate's own
 heel-to-toe length into the shoe, so the shape parameters change the foot the
 way real anatomy varies rather than uniformly shrinking one template.
+The accepted native-resolution fit then receives one canonical anatomical map
+and one shared deterministic subdiv2 surface. This preserves SUPR
+correspondence while providing a denser boundary for the future anatomical
+volume.
 
 The project intentionally does not yet include toe articulation, high-heel
 SUPR fitting, SDFs, learned optimization, or shoe reconstruction. The archived
@@ -337,8 +341,8 @@ SUPR, or change the fitted foot.
 
 ```bash
 python scripts/run_cavity_analysis.py \
-  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/canvas_shoe \
-  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_2/canvas_shoe \
+  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation/canvas_shoe \
+  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit/canvas_shoe \
   --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis/canvas_shoe
 ```
 
@@ -387,11 +391,11 @@ It never reruns footbed detection or normalization.
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python scripts/run_containment_fit.py \
-  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation_2/crocs \
-  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit_anchored/crocs \
-  --cavity-analysis-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis_anchored/crocs \
+  --preparation-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation/crocs \
+  --support-fit-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit/crocs \
+  --cavity-analysis-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/cavity_analysis/crocs \
   --supr-model ../baselines/SUPR/data/supr_male_right_foot.npy \
-  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit_beta_expanded_search/crocs
+  --output-dir /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit/crocs
 ```
 
 The deterministic search retains the individual and coupled ten-beta shapes
@@ -448,6 +452,72 @@ shoe collision checks remain CPU geometry calculations. Pass `--overwrite` to
 replace only the four known containment artifacts. The result JSON uses schema
 5 and records the ankle exemptions, deterministic expanded seeds, all exact
 broad candidates, and the ten refinement starts.
+
+## Canonical and dense SUPR anatomical surface
+
+Checkpoints 8 and 9 operate only on the accepted native fitted foot from
+Checkpoint 7. They do not reload the shoe, rerun fitting, or change the SUPR
+parameters or native vertices.
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_anatomical_surface.py \
+  --containment-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/containment_fit \
+  --supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male_right_foot.npy \
+  --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
+  --overwrite
+```
+
+With no positional shoe names, the CPU-only runner validates and processes all
+direct shoe directories in sorted order. Positional names such as
+`canvas_shoe sandal_1` restrict the run. Only native, normal-profile SUPR feet
+with the exact 266-vertex/515-face topology are accepted.
+
+The neutral right SUPR foot is the single reference surface `F_0`. It records
+all 13 joints, an ordered ankle-opening loop, stable surface landmarks, and two
+complementary color maps: longitudinal anatomy (ankle, heel, arch, forefoot,
+toes) and surface orientation (plantar, top, medial, lateral, posterior,
+anterior). A surface location is represented by its native SUPR face ID and
+three barycentric weights. Applying that same face and weights to any fitted
+SUPR foot gives the corresponding anatomical point without a flattened UV
+map.
+
+One deterministic two-level midpoint map subdivides every native surface:
+
+```text
+266 vertices / 515 faces
+        ->
+4,151 vertices / 8,240 faces
+```
+
+The first 266 vertices are the original fitted vertices. New vertices are
+exact weighted interpolations inside their original SUPR faces; no smoothing
+or projection occurs. The NPZ records the contributor IDs and weights, parent
+face of every dense triangle, canonical chart coordinates, joints, landmarks,
+and label arrays. Every fitted foot therefore has identical dense topology,
+vertex numbering, and anatomical labels while retaining its own accepted
+shape and pose.
+
+The output tree is:
+
+```text
+anatomical_surface/
+├── reference/
+│   ├── canonical_surface.json
+│   ├── canonical_surface.npz
+│   ├── neutral_dense.ply
+│   ├── regions_longitudinal.ply
+│   └── regions_surface.ply
+└── <shoe>/
+    ├── anatomical_surface.json
+    ├── foot_dense.ply
+    ├── regions_longitudinal.ply
+    └── regions_surface.ply
+```
+
+Load either colored region PLY to inspect transfer. The same colors must stay
+on the same anatomical parts for every shoe. `--overwrite` replaces only these
+known artifacts and leaves unrelated files intact.
 
 ## Current limitations
 
