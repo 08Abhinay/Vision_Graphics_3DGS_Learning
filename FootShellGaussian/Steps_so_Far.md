@@ -26,6 +26,7 @@ normal
   -> measure footbed contact and clearance from every other shoe surface
   -> fit SUPR shape and placement to the measured cavity
   -> transfer canonical anatomy to one shared dense SUPR surface
+  -> construct one shared tetrahedral foot-and-lower-leg anatomical volume
 
 high_heel
   -> detect the inclined interior support
@@ -69,6 +70,9 @@ Final native normal-shoe containment fits:
 
 Canonical and dense anatomical surfaces:
 /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface
+
+Canonical foot-and-lower-leg anatomical volume:
+/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_volume
 ```
 
 The manifest and processed dataset paths remain stable as shoes are added. Do
@@ -691,6 +695,139 @@ must always contain 4,151 vertices and 8,240 faces, with the first 266 vertices
 identical to the accepted native fitted foot. `--overwrite` replaces only the
 known artifacts and preserves unrelated files.
 
+## Step 15: Fit the lower-leg exit and inspect shoe collars
+
+This does not rerun fitting. It keeps every accepted dense fitted foot
+unchanged, aligns a near-neutral male SUPR shank at the fitted ankle, searches
+ankle pitch and roll, and reports exact bridge/lower-leg intersections with
+non-footbed shoe surfaces. The first ten full-body betas are used only as a
+secondary, tightly constrained correction. The fitter preserves a natural
+shaft even when that means honestly reporting a residual collar intersection.
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_lower_leg_attachment.py \
+  --anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
+  --preparation-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation \
+  --support-fit-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit \
+  --full-body-supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male.npy \
+  --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/lower_leg_attachment \
+  --overwrite
+```
+
+Each shoe receives `lower_leg_attachment.json`, `foot_lower_leg.ply`,
+`lower_leg_collar_colored.ply` and `lower_leg_collar_overlay.ply`. Blue is the
+unchanged fitted foot, cyan is the fitted near-neutral shank, orange is the
+ankle bridge, and red marks exact contact with the shoe. Empty opening space is
+allowed. The JSON records the neutral baseline, pose-only result, selected
+betas, girth ratios and any remaining collision.
+
+## Step 16: Transfer anatomy to the complete foot and lower leg
+
+This CPU-only step creates the missing anatomical map for the joined surface.
+It reads the accepted lower-leg attachments directly, so it does not rerun
+foot fitting, containment, or lower-leg optimization.
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_extended_anatomical_surface.py \
+  --anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
+  --lower-leg-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/lower_leg_attachment \
+  --full-body-supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male.npy \
+  --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/extended_anatomical_surface \
+  --overwrite
+```
+
+With no shoe names, all 16 accepted normal-shoe attachments are processed in
+sorted order. Every result has the same 6,951 vertices and 13,832 faces. The
+first 4,151 vertices and 8,240 faces remain the existing dense fitted foot.
+The remaining stable IDs describe the ankle transition and lower leg.
+
+The output contains one neutral reference plus one directory per shoe:
+
+```text
+extended_anatomical_surface/
+├── reference/
+│   ├── canonical_extended_surface.json
+│   ├── canonical_extended_surface.npz
+│   ├── neutral_foot_lower_leg.ply
+│   ├── regions_longitudinal.ply
+│   ├── regions_surface.ply
+│   └── regions_components.ply
+└── <shoe>/
+    ├── extended_anatomical_surface.json
+    ├── foot_lower_leg.ply
+    ├── regions_longitudinal.ply
+    ├── regions_surface.ply
+    └── regions_components.ply
+```
+
+Inspect the three region meshes. Longitudinal colors identify the original
+foot regions plus lower shaft, calf and upper shaft. Surface colors identify
+plantar/top, front/rear and medial/lateral directions. Component colors isolate
+the specialised foot, ankle bridge and lower-leg donor. The same color must
+remain attached to the same anatomical location for every shoe.
+
+The canonical NPZ preserves the old foot charts and adds one exact joined-skin
+coordinate: extended face ID plus three barycentric weights. It also stores the
+ankle correspondence, knee loop, joints, landmarks and subdivision provenance.
+The knee remains open and no tetrahedral volume is created in this step.
+
+## Step 17: Build the canonical foot-and-lower-leg anatomical volume
+
+Current limitation: the neutral SUPR foot contains intersecting toe/forefoot
+triangles. Gmsh cannot use that surface as an exact conforming boundary. Keep
+the accepted Checkpoints 8–9 surface unchanged and resolve the computational
+volume boundary before treating this step as complete.
+
+This CPU-only step runs once on the shared neutral dense reference. It does not
+process the individual shoe directories and does not rerun fitting. Install the
+optional dependency group once if needed:
+
+```bash
+cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
+
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python -m pip install -e ".[volume]"
+```
+
+Build the volume:
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_anatomical_volume.py \
+  --anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
+  --full-body-supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male.npy \
+  --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_volume \
+  --overwrite
+```
+
+The runner validates the existing `anatomical_surface/reference`, keeps its
+4,151 dense foot vertices and 8,240 faces unchanged, and extracts only the
+neutral male shank from the full-body SUPR donor. It aligns the shank rigidly,
+subdivides it twice, and joins its 60-vertex ankle loop to the foot with a
+deterministic bridge. It closes the remaining 68-vertex knee opening with a
+labelled computational cap, then asks Gmsh to fill the space between this
+anatomy and the fixed envelope. The smooth coordinate is `r=0` on the foot,
+bridge and real lower-leg skin and `r=1` on the envelope. The knee cap is not
+anatomical skin and its center is not assigned a fixed `r` value.
+
+The result is:
+
+```text
+anatomical_volume/reference/
+├── canonical_volume.json
+├── canonical_volume.npz
+├── canonical_volume.vtk
+├── inner_anatomical_boundary.ply
+├── outer_envelope.ply
+└── boundary_regions.ply
+```
+
+Inspect `canonical_volume.vtk` in ParaView with the `harmonic_r` scalar. Values
+should change smoothly from zero at the foot to one at the outside. Inspect
+`boundary_regions.ply` to distinguish the foot, ankle transition, lower leg,
+temporary knee cap, and outer envelope.
+
 ## Failure rules
 
 - If audit orientation is wrong, fix the manifest and rerun the audit.
@@ -705,8 +842,9 @@ known artifacts and preserves unrelated files.
 
 ## What comes next
 
-The current normal-shoe endpoint is the canonical, shared dense anatomical
-surface. The next anatomical checkpoint can extend this surface boundary with
-an outward coordinate `r` to form a volumetric anatomical domain. Toe
-articulation and other localized controls remain optional future containment
-work. High-heel SUPR fitting remains outside the current scope.
+The current accepted anatomical endpoint is the shared foot-and-lower-leg
+surface and its exact correspondence across all fitted instances. The next
+checkpoint will construct a valid computational tetrahedral boundary around
+that reference, followed later by the per-instance forward and inverse volume
+mappings. Toe articulation and other localized controls remain optional future
+containment work. High-heel SUPR fitting remains outside the current scope.

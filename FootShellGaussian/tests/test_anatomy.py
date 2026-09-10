@@ -9,13 +9,23 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 
 from foot_prior.anatomy import (
+    COMPONENT_REGION_NAMES,
+    DENSE_FOOT_FACE_COUNT,
+    DENSE_FOOT_VERTEX_COUNT,
+    EXTENDED_FACE_COUNT,
+    EXTENDED_LONGITUDINAL_REGION_NAMES,
+    EXTENDED_VERTEX_COUNT,
     JOINT_NAMES,
     LONGITUDINAL_REGION_NAMES,
     SURFACE_REGION_NAMES,
+    build_extended_canonical_supr_anatomy,
     build_canonical_supr_anatomy,
     build_dense_canonical_supr_anatomy,
+    directed_boundary_loop,
+    load_dense_canonical_supr_reference,
     map_surface_coordinates,
 )
 from foot_prior.mesh import load_triangle_mesh, save_triangle_mesh
@@ -26,6 +36,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SUPR_MODEL = REPOSITORY_ROOT / "baselines/SUPR/data/supr_male_right_foot.npy"
 RUNNER = PROJECT_ROOT / "scripts/run_anatomical_surface.py"
+ANATOMICAL_SURFACE_ROOT = Path(
+    "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface"
+)
+FULL_BODY_MODEL = REPOSITORY_ROOT / "baselines/SUPR/data/supr_male.npy"
 
 
 def _digest(path: Path) -> str:
@@ -103,6 +117,52 @@ def test_subdiv2_provenance_and_surface_coordinates_are_exact() -> None:
         anatomy.raw_mesh.faces,
     )
     np.testing.assert_allclose(mapped, expected, atol=1e-15)
+
+
+@pytest.mark.skipif(
+    not ANATOMICAL_SURFACE_ROOT.is_dir() or not FULL_BODY_MODEL.is_file(),
+    reason="Checkpoint 9 reference or full-body SUPR donor absent",
+)
+def test_extended_anatomy_preserves_foot_and_transfers_by_shared_ids() -> None:
+    reference = load_dense_canonical_supr_reference(ANATOMICAL_SURFACE_ROOT)
+    first = build_extended_canonical_supr_anatomy(reference, FULL_BODY_MODEL)
+    second = build_extended_canonical_supr_anatomy(reference, FULL_BODY_MODEL)
+
+    assert first.vertices.shape == (EXTENDED_VERTEX_COUNT, 3)
+    assert first.faces.shape == (EXTENDED_FACE_COUNT, 3)
+    np.testing.assert_array_equal(
+        first.vertices[:DENSE_FOOT_VERTEX_COUNT], reference.vertices
+    )
+    np.testing.assert_array_equal(
+        first.faces[:DENSE_FOOT_FACE_COUNT], reference.faces
+    )
+    np.testing.assert_array_equal(first.vertices, second.vertices)
+    np.testing.assert_array_equal(first.faces, second.faces)
+    np.testing.assert_array_equal(
+        first.longitudinal_vertex_labels, second.longitudinal_vertex_labels
+    )
+    assert len(first.knee_loop) == 68
+    np.testing.assert_array_equal(directed_boundary_loop(first.faces), first.knee_loop)
+    assert set(np.unique(first.longitudinal_vertex_labels)) == set(
+        range(len(EXTENDED_LONGITUDINAL_REGION_NAMES))
+    )
+    assert set(np.unique(first.surface_vertex_labels)) == set(
+        range(len(SURFACE_REGION_NAMES))
+    )
+    assert set(np.unique(first.component_face_labels)) == set(
+        range(len(COMPONENT_REGION_NAMES))
+    )
+    np.testing.assert_array_equal(
+        first.longitudinal_vertex_labels[:DENSE_FOOT_VERTEX_COUNT],
+        reference.longitudinal_vertex_labels,
+    )
+    mapped = map_surface_coordinates(
+        first.vertex_chart_face_indices,
+        first.vertex_chart_barycentric,
+        first.vertices,
+        first.faces,
+    )
+    np.testing.assert_array_equal(mapped, first.vertices)
 
 
 def test_runner_writes_repeatable_shared_topology_and_rejects_high_heels(

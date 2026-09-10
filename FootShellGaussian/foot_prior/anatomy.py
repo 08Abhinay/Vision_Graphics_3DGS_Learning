@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +18,20 @@ from .alignment import (
     neutral_length_scale,
     transform_points,
 )
-from .mesh import TriangleMesh
-from .supr_foot import SuprMeshSubdivision, load_neutral_supr_foot
+from .mesh import TriangleMesh, load_triangle_mesh
+from .supr_foot import (
+    SuprMeshSubdivision,
+    build_supr_mesh_subdivision,
+    load_neutral_supr_foot,
+)
+from .supr_lower_leg import (
+    RIGHT_ANKLE_JOINT_INDEX,
+    RIGHT_FOOT_JOINT_INDEX,
+    RIGHT_KNEE_JOINT_INDEX,
+    SuprLowerLeg,
+    _ordered_boundary_loops,
+    build_canonical_right_lower_leg,
+)
 
 
 JOINT_NAMES = (
@@ -62,6 +76,40 @@ SURFACE_COLORS = np.asarray(
         (155, 80, 205, 255),
         (220, 70, 70, 255),
         (235, 205, 55, 255),
+    ),
+    dtype=np.uint8,
+)
+
+DENSE_FOOT_VERTEX_COUNT = 4_151
+DENSE_FOOT_FACE_COUNT = 8_240
+DENSE_ANKLE_VERTEX_COUNT = 60
+EXTENDED_VERTEX_COUNT = 6_951
+EXTENDED_FACE_COUNT = 13_832
+EXTENDED_LONGITUDINAL_REGION_NAMES = (
+    *LONGITUDINAL_REGION_NAMES,
+    "lower_shaft",
+    "calf",
+    "upper_shaft",
+)
+EXTENDED_LONGITUDINAL_COLORS = np.vstack(
+    (
+        LONGITUDINAL_COLORS,
+        np.asarray(
+            (
+                (55, 175, 205, 255),
+                (45, 135, 180, 255),
+                (35, 95, 150, 255),
+            ),
+            dtype=np.uint8,
+        ),
+    )
+)
+COMPONENT_REGION_NAMES = ("foot_skin", "ankle_transition", "lower_leg_skin")
+COMPONENT_COLORS = np.asarray(
+    (
+        (45, 105, 220, 255),
+        (240, 145, 50, 255),
+        (55, 175, 205, 255),
     ),
     dtype=np.uint8,
 )
@@ -155,6 +203,100 @@ class DenseCanonicalSuprAnatomy:
     @property
     def surface_colors(self) -> np.ndarray:
         return SURFACE_COLORS[self.surface_vertex_labels]
+
+
+@dataclass(frozen=True)
+class DenseCanonicalSuprReference:
+    """Validated Checkpoint 9 reference loaded without rebuilding SUPR."""
+
+    vertices: np.ndarray
+    faces: np.ndarray
+    ankle_loop: np.ndarray
+    native_vertices: np.ndarray
+    native_faces: np.ndarray
+    native_ankle_loop: np.ndarray
+    joint_names: tuple[str, ...]
+    reference_joints: np.ndarray
+    raw_supr_to_reference: np.ndarray
+    reference_to_raw_supr: np.ndarray
+    dense_vertex_source_indices: np.ndarray
+    dense_vertex_source_weights: np.ndarray
+    dense_face_parent_indices: np.ndarray
+    vertex_chart_face_indices: np.ndarray
+    vertex_chart_barycentric: np.ndarray
+    longitudinal_vertex_labels: np.ndarray
+    longitudinal_face_labels: np.ndarray
+    surface_vertex_labels: np.ndarray
+    surface_face_labels: np.ndarray
+    foot_landmarks: dict[str, dict[str, Any]]
+    dense_surface_digest: str
+    topology_digest: str
+
+
+@dataclass(frozen=True)
+class ExtendedCanonicalSuprAnatomy:
+    """Canonical dense foot and lower leg with shared anatomical maps."""
+
+    vertices: np.ndarray
+    faces: np.ndarray
+    foot_face_indices: np.ndarray
+    lower_leg_face_indices: np.ndarray
+    bridge_face_indices: np.ndarray
+    dense_foot_indices: np.ndarray
+    lower_leg_indices: np.ndarray
+    knee_loop: np.ndarray
+    ankle_correspondence: np.ndarray
+    lower_leg: SuprLowerLeg
+    lower_leg_subdivision: SuprMeshSubdivision
+    lower_leg_metadata: dict[str, Any]
+    attachment_diagnostics: dict[str, Any]
+    vertex_chart_face_indices: np.ndarray
+    vertex_chart_barycentric: np.ndarray
+    foot_native_chart_face_indices: np.ndarray
+    foot_native_chart_barycentric: np.ndarray
+    foot_native_vertices: np.ndarray
+    foot_native_faces: np.ndarray
+    raw_supr_to_reference: np.ndarray
+    reference_to_raw_supr: np.ndarray
+    foot_dense_vertex_source_indices: np.ndarray
+    foot_dense_vertex_source_weights: np.ndarray
+    foot_dense_face_parent_indices: np.ndarray
+    longitudinal_vertex_labels: np.ndarray
+    longitudinal_face_labels: np.ndarray
+    surface_vertex_labels: np.ndarray
+    surface_face_labels: np.ndarray
+    component_vertex_labels: np.ndarray
+    component_face_labels: np.ndarray
+    landmarks: dict[str, dict[str, Any]]
+    foot_joint_names: tuple[str, ...]
+    foot_reference_joints: np.ndarray
+    lower_leg_joint_names: tuple[str, ...]
+    lower_leg_joint_source_indices: np.ndarray
+    lower_leg_reference_joints: np.ndarray
+    anatomical_frame: np.ndarray
+    digest: str
+    topology_digest: str
+
+    @property
+    def mesh(self) -> TriangleMesh:
+        return TriangleMesh(self.vertices, self.faces)
+
+    @property
+    def longitudinal_colors(self) -> np.ndarray:
+        return EXTENDED_LONGITUDINAL_COLORS[self.longitudinal_vertex_labels]
+
+    @property
+    def surface_colors(self) -> np.ndarray:
+        return SURFACE_COLORS[self.surface_vertex_labels]
+
+    @property
+    def component_colors(self) -> np.ndarray:
+        colors = COMPONENT_COLORS[self.component_vertex_labels].copy()
+        transition_vertices = np.unique(self.faces[self.bridge_face_indices])
+        colors[transition_vertices] = COMPONENT_COLORS[
+            COMPONENT_REGION_NAMES.index("ankle_transition")
+        ]
+        return colors
 
 
 def _label_record(
@@ -508,3 +650,610 @@ def map_surface_coordinates(
     ):
         raise ValueError("barycentric weights must be finite, nonnegative, and sum to one")
     return np.einsum("ni,nij->nj", weights, vertices[faces[indices]])
+
+
+def array_digest(*arrays: np.ndarray) -> str:
+    """Return the deterministic array digest used by anatomical stages."""
+
+    digest = hashlib.sha256()
+    for array in arrays:
+        values = np.ascontiguousarray(array)
+        digest.update(values.dtype.str.encode("ascii"))
+        digest.update(np.asarray(values.shape, dtype="<i8").tobytes())
+        digest.update(values.tobytes())
+    return digest.hexdigest()
+
+
+def topology_digest(faces: np.ndarray) -> str:
+    """Return a topology-only digest independent of vertex positions."""
+
+    return hashlib.sha256(
+        np.ascontiguousarray(faces, dtype="<i8").tobytes()
+    ).hexdigest()
+
+
+def directed_boundary_loop(faces: np.ndarray) -> np.ndarray:
+    """Return the single consistently wound boundary loop of a surface."""
+
+    values = np.asarray(faces, dtype=np.int64)
+    directed = np.concatenate(
+        (values[:, (0, 1)], values[:, (1, 2)], values[:, (2, 0)]), axis=0
+    )
+    undirected = np.sort(directed, axis=1)
+    _, inverse, counts = np.unique(
+        undirected, axis=0, return_inverse=True, return_counts=True
+    )
+    if np.any(counts > 2):
+        raise ValueError("dense anatomical surface contains a non-manifold edge")
+    boundary = directed[counts[inverse] == 1]
+    if len(boundary) == 0:
+        raise ValueError("dense anatomical surface has no boundary")
+    following: dict[int, int] = {}
+    incoming: dict[int, int] = {}
+    for first, second in boundary:
+        first_int, second_int = int(first), int(second)
+        if first_int in following or second_int in incoming:
+            raise ValueError(
+                "dense anatomical boundary is not one consistently wound loop"
+            )
+        following[first_int] = second_int
+        incoming[second_int] = first_int
+    if set(following) != set(incoming):
+        raise ValueError("dense anatomical boundary is not closed")
+    start = min(following)
+    result: list[int] = []
+    current = start
+    while current not in result:
+        result.append(current)
+        current = following[current]
+    if current != start or len(result) != len(following):
+        raise ValueError("dense anatomical surface contains multiple boundary loops")
+    return np.asarray(result, dtype=np.int64)
+
+
+def load_dense_canonical_supr_reference(
+    anatomical_surface_root: str | Path,
+) -> DenseCanonicalSuprReference:
+    """Load and validate the existing Checkpoint 9 canonical reference."""
+
+    root = Path(anatomical_surface_root).expanduser().resolve(strict=True)
+    reference = root / "reference"
+    if not reference.is_dir():
+        raise NotADirectoryError(reference)
+    json_path = reference / "canonical_surface.json"
+    npz_path = reference / "canonical_surface.npz"
+    ply_path = reference / "neutral_dense.ply"
+    for path in (json_path, npz_path, ply_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    try:
+        metadata = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError("Checkpoint 9 canonical_surface.json is invalid") from error
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("schema_version") != 1
+        or metadata.get("stage")
+        != "canonical_dense_supr_anatomical_reference"
+    ):
+        raise ValueError("Checkpoint 9 reference metadata has an unsupported schema")
+
+    required = {
+        "dense_reference_vertices",
+        "dense_faces",
+        "dense_ankle_boundary_vertex_indices",
+        "reference_vertices",
+        "dense_vertex_source_indices",
+        "dense_vertex_source_weights",
+        "dense_face_parent_indices",
+        "dense_vertex_chart_face_indices",
+        "dense_vertex_chart_barycentric",
+        "dense_longitudinal_vertex_labels",
+        "dense_longitudinal_face_labels",
+        "dense_surface_vertex_labels",
+        "dense_surface_face_labels",
+        "native_faces",
+        "ankle_boundary_vertex_indices",
+        "joint_names",
+        "reference_joints",
+        "raw_supr_to_reference",
+        "reference_to_raw_supr",
+    }
+    with np.load(npz_path, allow_pickle=False) as archive:
+        missing = sorted(required.difference(archive.files))
+        if missing:
+            raise ValueError(f"Checkpoint 9 NPZ is missing arrays: {missing}")
+        arrays = {name: np.asarray(archive[name]) for name in required}
+
+    vertices = np.asarray(arrays["dense_reference_vertices"], dtype=np.float64)
+    faces = np.asarray(arrays["dense_faces"], dtype=np.int64)
+    ankle_loop = np.asarray(
+        arrays["dense_ankle_boundary_vertex_indices"], dtype=np.int64
+    )
+    native_vertices = np.asarray(arrays["reference_vertices"], dtype=np.float64)
+    native_faces = np.asarray(arrays["native_faces"], dtype=np.int64)
+    native_ankle_loop = np.asarray(
+        arrays["ankle_boundary_vertex_indices"], dtype=np.int64
+    )
+    if vertices.shape != (DENSE_FOOT_VERTEX_COUNT, 3) or faces.shape != (
+        DENSE_FOOT_FACE_COUNT,
+        3,
+    ):
+        raise ValueError("Checkpoint 9 dense topology must be 4,151/8,240")
+    if (
+        native_vertices.shape != (266, 3)
+        or native_faces.shape != (515, 3)
+        or not np.array_equal(vertices[:266], native_vertices)
+    ):
+        raise ValueError("Checkpoint 9 native SUPR correspondence is invalid")
+    if (
+        np.any(faces < 0)
+        or np.any(faces >= len(vertices))
+        or not np.isfinite(vertices).all()
+    ):
+        raise ValueError("Checkpoint 9 dense mesh contains invalid geometry")
+    if ankle_loop.shape != (DENSE_ANKLE_VERTEX_COUNT,) or not np.array_equal(
+        directed_boundary_loop(faces), ankle_loop
+    ):
+        raise ValueError("Checkpoint 9 dense ankle boundary is invalid")
+    if (
+        native_ankle_loop.shape != (15,)
+        or len(np.unique(native_ankle_loop)) != 15
+        or np.any(native_ankle_loop < 0)
+        or np.any(native_ankle_loop >= len(native_vertices))
+    ):
+        raise ValueError("Checkpoint 9 native ankle boundary is invalid")
+
+    source_indices = np.asarray(arrays["dense_vertex_source_indices"], dtype=np.int64)
+    source_weights = np.asarray(arrays["dense_vertex_source_weights"], dtype=np.float64)
+    face_parents = np.asarray(arrays["dense_face_parent_indices"], dtype=np.int64)
+    chart_faces = np.asarray(arrays["dense_vertex_chart_face_indices"], dtype=np.int64)
+    chart_weights = np.asarray(
+        arrays["dense_vertex_chart_barycentric"], dtype=np.float64
+    )
+    if (
+        source_indices.shape != (DENSE_FOOT_VERTEX_COUNT, 3)
+        or source_weights.shape != (DENSE_FOOT_VERTEX_COUNT, 3)
+        or face_parents.shape != (DENSE_FOOT_FACE_COUNT,)
+        or chart_faces.shape != (DENSE_FOOT_VERTEX_COUNT,)
+        or chart_weights.shape != (DENSE_FOOT_VERTEX_COUNT, 3)
+        or not np.array_equal(source_indices[:266, 0], np.arange(266))
+        or not np.all(source_indices[:266, 1:] == -1)
+        or not np.array_equal(source_weights[:266, 0], np.ones(266))
+        or not np.all(source_weights[:266, 1:] == 0.0)
+        or np.any(face_parents < 0)
+        or np.any(face_parents >= len(native_faces))
+        or np.any(chart_faces < 0)
+        or np.any(chart_faces >= len(native_faces))
+        or not np.isfinite(source_weights).all()
+        or not np.isfinite(chart_weights).all()
+        or np.any(source_weights < -1.0e-12)
+        or np.any(chart_weights < -1.0e-12)
+        or not np.allclose(source_weights.sum(axis=1), 1.0, atol=1.0e-12)
+        or not np.allclose(chart_weights.sum(axis=1), 1.0, atol=1.0e-12)
+    ):
+        raise ValueError("Checkpoint 9 subdivision provenance is invalid")
+    reconstructed = map_surface_coordinates(
+        chart_faces, chart_weights, native_vertices, native_faces
+    )
+    if not np.allclose(reconstructed, vertices, atol=1.0e-12, rtol=0.0):
+        raise ValueError("Checkpoint 9 surface charts do not reconstruct the foot")
+
+    joint_names = tuple(str(value) for value in arrays["joint_names"].tolist())
+    reference_joints = np.asarray(arrays["reference_joints"], dtype=np.float64)
+    forward = np.asarray(arrays["raw_supr_to_reference"], dtype=np.float64)
+    inverse = np.asarray(arrays["reference_to_raw_supr"], dtype=np.float64)
+    if (
+        joint_names != JOINT_NAMES
+        or reference_joints.shape != (len(JOINT_NAMES), 3)
+        or forward.shape != (4, 4)
+        or inverse.shape != (4, 4)
+        or not np.isfinite(reference_joints).all()
+        or not np.isfinite(forward).all()
+        or not np.isfinite(inverse).all()
+        or not np.allclose(forward @ inverse, np.eye(4), atol=1.0e-12, rtol=0.0)
+        or not np.allclose(inverse @ forward, np.eye(4), atol=1.0e-12, rtol=0.0)
+    ):
+        raise ValueError("Checkpoint 9 joints or canonical transform are invalid")
+
+    longitudinal_vertices = np.asarray(
+        arrays["dense_longitudinal_vertex_labels"], dtype=np.int16
+    )
+    longitudinal_faces = np.asarray(
+        arrays["dense_longitudinal_face_labels"], dtype=np.int16
+    )
+    surface_vertices = np.asarray(
+        arrays["dense_surface_vertex_labels"], dtype=np.int16
+    )
+    surface_faces = np.asarray(
+        arrays["dense_surface_face_labels"], dtype=np.int16
+    )
+    if (
+        longitudinal_vertices.shape != (DENSE_FOOT_VERTEX_COUNT,)
+        or longitudinal_faces.shape != (DENSE_FOOT_FACE_COUNT,)
+        or surface_vertices.shape != (DENSE_FOOT_VERTEX_COUNT,)
+        or surface_faces.shape != (DENSE_FOOT_FACE_COUNT,)
+    ):
+        raise ValueError("Checkpoint 9 anatomical labels are invalid")
+
+    dense_digest = array_digest(vertices, faces)
+    dense_topology = topology_digest(faces)
+    digests = metadata.get("digests", {})
+    if (
+        digests.get("canonical_dense_surface_sha256") != dense_digest
+        or digests.get("dense_topology_sha256") != dense_topology
+    ):
+        raise ValueError("Checkpoint 9 reference digest does not match")
+    saved_mesh = load_triangle_mesh(ply_path)
+    if not np.array_equal(saved_mesh.faces, faces) or not np.allclose(
+        saved_mesh.vertices, vertices, atol=5.0e-8, rtol=0.0
+    ):
+        raise ValueError("Checkpoint 9 neutral_dense.ply disagrees with its NPZ")
+    landmarks = metadata.get("landmarks")
+    if not isinstance(landmarks, dict):
+        raise ValueError("Checkpoint 9 foot landmarks are missing")
+    return DenseCanonicalSuprReference(
+        vertices=vertices,
+        faces=faces,
+        ankle_loop=ankle_loop,
+        native_vertices=native_vertices,
+        native_faces=native_faces,
+        native_ankle_loop=native_ankle_loop,
+        joint_names=joint_names,
+        reference_joints=reference_joints,
+        raw_supr_to_reference=forward,
+        reference_to_raw_supr=inverse,
+        dense_vertex_source_indices=source_indices,
+        dense_vertex_source_weights=source_weights,
+        dense_face_parent_indices=face_parents,
+        vertex_chart_face_indices=chart_faces,
+        vertex_chart_barycentric=chart_weights,
+        longitudinal_vertex_labels=longitudinal_vertices,
+        longitudinal_face_labels=longitudinal_faces,
+        surface_vertex_labels=surface_vertices,
+        surface_face_labels=surface_faces,
+        foot_landmarks=landmarks,
+        dense_surface_digest=dense_digest,
+        topology_digest=dense_topology,
+    )
+
+
+def _bridge_faces(foot_loop: np.ndarray, leg_loop: np.ndarray) -> np.ndarray:
+    faces: list[tuple[int, int, int]] = []
+    for index in range(len(foot_loop)):
+        following = (index + 1) % len(foot_loop)
+        faces.append(
+            (int(foot_loop[index]), int(leg_loop[index]), int(foot_loop[following]))
+        )
+        faces.append(
+            (
+                int(foot_loop[following]),
+                int(leg_loop[index]),
+                int(leg_loop[following]),
+            )
+        )
+    return np.asarray(faces, dtype=np.int64)
+
+
+def _vertex_charts_for_topology(faces: np.ndarray, vertex_count: int) -> tuple[np.ndarray, np.ndarray]:
+    chart_faces = np.full(vertex_count, -1, dtype=np.int64)
+    barycentric = np.zeros((vertex_count, 3), dtype=np.float64)
+    for face_index, face in enumerate(faces):
+        for corner, vertex in enumerate(face):
+            vertex_index = int(vertex)
+            if chart_faces[vertex_index] < 0:
+                chart_faces[vertex_index] = face_index
+                barycentric[vertex_index, corner] = 1.0
+    if np.any(chart_faces < 0):
+        raise ValueError("extended surface contains an unused vertex")
+    return chart_faces, barycentric
+
+
+def _anatomical_frame(lower_leg: SuprLowerLeg) -> np.ndarray:
+    joints = lower_leg.source_joints_reference
+    ankle = joints[RIGHT_ANKLE_JOINT_INDEX]
+    up = joints[RIGHT_KNEE_JOINT_INDEX] - ankle
+    up /= np.linalg.norm(up)
+    forward = joints[RIGHT_FOOT_JOINT_INDEX] - ankle
+    forward -= up * float(np.dot(forward, up))
+    forward /= np.linalg.norm(forward)
+    lateral = np.cross(forward, up)
+    lateral /= np.linalg.norm(lateral)
+    forward = np.cross(up, lateral)
+    forward /= np.linalg.norm(forward)
+    return np.column_stack((forward, up, lateral))
+
+
+def _frame_surface_labels(normals: np.ndarray, frame: np.ndarray) -> np.ndarray:
+    local = np.asarray(normals, dtype=np.float64) @ np.asarray(frame, dtype=np.float64)
+    dominant = np.argmax(np.abs(local), axis=1)
+    labels = np.empty(len(local), dtype=np.int16)
+    labels[(dominant == 0) & (local[:, 0] >= 0.0)] = SURFACE_REGION_NAMES.index("anterior")
+    labels[(dominant == 0) & (local[:, 0] < 0.0)] = SURFACE_REGION_NAMES.index("posterior")
+    labels[(dominant == 1) & (local[:, 1] >= 0.0)] = SURFACE_REGION_NAMES.index("top")
+    labels[(dominant == 1) & (local[:, 1] < 0.0)] = SURFACE_REGION_NAMES.index("plantar")
+    labels[(dominant == 2) & (local[:, 2] >= 0.0)] = SURFACE_REGION_NAMES.index("lateral")
+    labels[(dominant == 2) & (local[:, 2] < 0.0)] = SURFACE_REGION_NAMES.index("medial")
+    return labels
+
+
+def _lower_leg_longitudinal_labels(
+    points: np.ndarray,
+    ankle_center: np.ndarray,
+    knee_center: np.ndarray,
+) -> np.ndarray:
+    axis = np.asarray(knee_center) - np.asarray(ankle_center)
+    length_squared = float(np.dot(axis, axis))
+    if length_squared <= np.finfo(np.float64).eps:
+        raise ValueError("lower-leg ankle and knee centers coincide")
+    fraction = (np.asarray(points) - ankle_center) @ axis / length_squared
+    labels = np.full(len(points), EXTENDED_LONGITUDINAL_REGION_NAMES.index("calf"), dtype=np.int16)
+    labels[fraction < 1.0 / 3.0] = EXTENDED_LONGITUDINAL_REGION_NAMES.index("lower_shaft")
+    labels[fraction >= 2.0 / 3.0] = EXTENDED_LONGITUDINAL_REGION_NAMES.index("upper_shaft")
+    return labels
+
+
+def _projected_landmark(
+    vertices: np.ndarray,
+    candidates: np.ndarray,
+    direction: np.ndarray,
+    maximum: bool,
+) -> dict[str, Any]:
+    indices = np.asarray(candidates, dtype=np.int64)
+    values = np.asarray(vertices)[indices] @ np.asarray(direction, dtype=np.float64)
+    selected = int(indices[np.argmax(values) if maximum else np.argmin(values)])
+    return {
+        "vertex_indices": [selected],
+        "primary_vertex_index": selected,
+        "point_reference": np.asarray(vertices)[selected].tolist(),
+    }
+
+
+def build_extended_canonical_supr_anatomy(
+    reference: DenseCanonicalSuprReference,
+    full_body_supr_model: str | Path,
+) -> ExtendedCanonicalSuprAnatomy:
+    """Join and label the canonical dense foot and neutral right lower leg."""
+
+    lower_leg = build_canonical_right_lower_leg(
+        full_body_supr_model,
+        reference.raw_supr_to_reference,
+        reference.reference_joints,
+        reference.native_vertices[reference.native_ankle_loop],
+    )
+    subdivision = build_supr_mesh_subdivision(
+        lower_leg.mesh.faces, len(lower_leg.mesh.vertices), 2
+    )
+    dense_leg = subdivision.apply_mesh(lower_leg.mesh)
+    loops = _ordered_boundary_loops(dense_leg.faces)
+    if sorted(len(loop) for loop in loops) != [60, 68]:
+        raise ValueError("subdivided lower leg must have 60/68 ankle and knee loops")
+    distal = next(loop for loop in loops if len(loop) == 60)
+    proximal = next(loop for loop in loops if len(loop) == 68)
+
+    foot_loop = reference.ankle_loop
+    leg_offset = len(reference.vertices)
+    candidates: list[tuple[float, int, int, np.ndarray, np.ndarray, np.ndarray]] = []
+    for reversed_direction in (0, 1):
+        ordered = distal if reversed_direction == 0 else distal[::-1]
+        for shift in range(len(ordered)):
+            paired_local = np.roll(ordered, -shift)
+            native_pairs = (foot_loop < 266) & (
+                paired_local < len(lower_leg.mesh.vertices)
+            )
+            if int(np.count_nonzero(native_pairs)) != 15:
+                continue
+            paired_global = paired_local + leg_offset
+            bridge = _bridge_faces(foot_loop, paired_global)
+            faces = np.vstack(
+                (reference.faces, dense_leg.faces + leg_offset, bridge)
+            )
+            try:
+                remaining_loop = directed_boundary_loop(faces)
+            except ValueError:
+                continue
+            if len(remaining_loop) != 68 or set(remaining_loop) != set(
+                (proximal + leg_offset).tolist()
+            ):
+                continue
+            residual = float(
+                np.sum(
+                    (reference.vertices[foot_loop] - dense_leg.vertices[paired_local])
+                    ** 2
+                )
+            )
+            candidates.append(
+                (
+                    residual,
+                    reversed_direction,
+                    shift,
+                    paired_local,
+                    bridge,
+                    remaining_loop,
+                )
+            )
+    if not candidates:
+        raise ValueError("no consistently wound ankle-loop correspondence exists")
+    candidates.sort(key=lambda value: (value[0], value[1], value[2]))
+    residual, direction, shift, paired_local, bridge, knee_loop = candidates[0]
+    vertices = np.vstack((reference.vertices, dense_leg.vertices))
+    faces = np.vstack((reference.faces, dense_leg.faces + leg_offset, bridge))
+    if vertices.shape != (EXTENDED_VERTEX_COUNT, 3) or faces.shape != (
+        EXTENDED_FACE_COUNT,
+        3,
+    ):
+        raise ValueError("extended SUPR topology must be 6,951/13,832")
+    if not np.array_equal(vertices[:DENSE_FOOT_VERTEX_COUNT], reference.vertices):
+        raise RuntimeError("extended anatomy changed a Checkpoint 9 foot vertex")
+    if not np.array_equal(faces[:DENSE_FOOT_FACE_COUNT], reference.faces):
+        raise RuntimeError("extended anatomy changed a Checkpoint 9 foot face")
+    bridge_triangles = vertices[bridge]
+    bridge_areas = np.linalg.norm(
+        np.cross(
+            bridge_triangles[:, 1] - bridge_triangles[:, 0],
+            bridge_triangles[:, 2] - bridge_triangles[:, 0],
+        ),
+        axis=1,
+    )
+    if np.any(bridge_areas <= 128.0 * np.finfo(np.float64).eps):
+        raise ValueError("ankle bridge contains a degenerate triangle")
+
+    foot_faces = np.arange(DENSE_FOOT_FACE_COUNT, dtype=np.int64)
+    leg_faces = np.arange(
+        DENSE_FOOT_FACE_COUNT,
+        DENSE_FOOT_FACE_COUNT + len(dense_leg.faces),
+        dtype=np.int64,
+    )
+    bridge_faces = np.arange(
+        DENSE_FOOT_FACE_COUNT + len(dense_leg.faces), len(faces), dtype=np.int64
+    )
+    correspondence = np.column_stack((foot_loop, paired_local + leg_offset))
+    if int(
+        np.count_nonzero(
+            (correspondence[:, 0] < 266)
+            & (correspondence[:, 1] - leg_offset < len(lower_leg.mesh.vertices))
+        )
+    ) != 15:
+        raise RuntimeError("ankle attachment lost native loop correspondence")
+
+    frame = _anatomical_frame(lower_leg)
+    ankle_center = dense_leg.vertices[paired_local].mean(axis=0)
+    knee_center = vertices[knee_loop].mean(axis=0)
+    leg_vertex_longitudinal = _lower_leg_longitudinal_labels(
+        dense_leg.vertices, ankle_center, knee_center
+    )
+    leg_face_longitudinal = _lower_leg_longitudinal_labels(
+        dense_leg.vertices[dense_leg.faces].mean(axis=1), ankle_center, knee_center
+    )
+    longitudinal_vertices = np.concatenate(
+        (reference.longitudinal_vertex_labels, leg_vertex_longitudinal)
+    )
+    longitudinal_faces = np.concatenate(
+        (
+            reference.longitudinal_face_labels,
+            leg_face_longitudinal,
+            np.full(len(bridge), LONGITUDINAL_REGION_NAMES.index("ankle"), dtype=np.int16),
+        )
+    )
+    leg_vertex_normals, leg_face_normals = _weighted_normals(dense_leg)
+    bridge_triangles = vertices[bridge]
+    bridge_crosses = np.cross(
+        bridge_triangles[:, 1] - bridge_triangles[:, 0],
+        bridge_triangles[:, 2] - bridge_triangles[:, 0],
+    )
+    bridge_face_normals = bridge_crosses / np.linalg.norm(
+        bridge_crosses, axis=1
+    )[:, None]
+    surface_vertices = np.concatenate(
+        (reference.surface_vertex_labels, _frame_surface_labels(leg_vertex_normals, frame))
+    )
+    surface_faces = np.concatenate(
+        (
+            reference.surface_face_labels,
+            _frame_surface_labels(leg_face_normals, frame),
+            _frame_surface_labels(bridge_face_normals, frame),
+        )
+    )
+    component_vertices = np.concatenate(
+        (
+            np.full(DENSE_FOOT_VERTEX_COUNT, COMPONENT_REGION_NAMES.index("foot_skin"), dtype=np.int16),
+            np.full(len(dense_leg.vertices), COMPONENT_REGION_NAMES.index("lower_leg_skin"), dtype=np.int16),
+        )
+    )
+    component_faces = np.empty(len(faces), dtype=np.int16)
+    component_faces[foot_faces] = COMPONENT_REGION_NAMES.index("foot_skin")
+    component_faces[leg_faces] = COMPONENT_REGION_NAMES.index("lower_leg_skin")
+    component_faces[bridge_faces] = COMPONENT_REGION_NAMES.index("ankle_transition")
+
+    chart_faces, chart_weights = _vertex_charts_for_topology(faces, len(vertices))
+    reconstructed = map_surface_coordinates(chart_faces, chart_weights, vertices, faces)
+    if not np.array_equal(reconstructed, vertices):
+        raise RuntimeError("extended surface charts do not reconstruct its vertices")
+
+    axis_values = (dense_leg.vertices - ankle_center) @ frame[:, 1]
+    span = float((knee_center - ankle_center) @ frame[:, 1])
+    middle_local = np.flatnonzero(
+        (axis_values >= 0.4 * span) & (axis_values <= 0.6 * span)
+    )
+    if len(middle_local) == 0:
+        raise RuntimeError("lower leg has no mid-shaft landmark candidates")
+    middle_global = middle_local + leg_offset
+    landmarks = dict(reference.foot_landmarks)
+    landmarks.update(
+        {
+            "foot_ankle_boundary_center": {
+                "vertex_indices": foot_loop.tolist(),
+                "primary_vertex_index": int(np.min(foot_loop)),
+                "point_reference": reference.vertices[foot_loop].mean(axis=0).tolist(),
+            },
+            "lower_leg_ankle_boundary_center": {
+                "vertex_indices": (paired_local + leg_offset).tolist(),
+                "primary_vertex_index": int(np.min(paired_local + leg_offset)),
+                "point_reference": ankle_center.tolist(),
+            },
+            "knee_boundary_center": {
+                "vertex_indices": knee_loop.tolist(),
+                "primary_vertex_index": int(np.min(knee_loop)),
+                "point_reference": knee_center.tolist(),
+            },
+            "anterior_mid_shaft": _projected_landmark(vertices, middle_global, frame[:, 0], True),
+            "posterior_mid_shaft": _projected_landmark(vertices, middle_global, frame[:, 0], False),
+            "medial_mid_shaft": _projected_landmark(vertices, middle_global, frame[:, 2], False),
+            "lateral_mid_shaft": _projected_landmark(vertices, middle_global, frame[:, 2], True),
+        }
+    )
+    lower_leg_metadata = lower_leg.to_dict()
+    lower_leg_metadata["subdivision"] = subdivision.to_dict()
+    lower_leg_metadata["dense_vertex_count"] = int(len(dense_leg.vertices))
+    lower_leg_metadata["dense_face_count"] = int(len(dense_leg.faces))
+    lower_leg_metadata["dense_ankle_boundary_count"] = 60
+    lower_leg_metadata["dense_knee_boundary_count"] = 68
+    joint_indices = np.asarray(
+        (RIGHT_KNEE_JOINT_INDEX, RIGHT_ANKLE_JOINT_INDEX, RIGHT_FOOT_JOINT_INDEX),
+        dtype=np.int64,
+    )
+    return ExtendedCanonicalSuprAnatomy(
+        vertices=vertices,
+        faces=faces,
+        foot_face_indices=foot_faces,
+        lower_leg_face_indices=leg_faces,
+        bridge_face_indices=bridge_faces,
+        dense_foot_indices=np.arange(DENSE_FOOT_VERTEX_COUNT, dtype=np.int64),
+        lower_leg_indices=np.arange(leg_offset, len(vertices), dtype=np.int64),
+        knee_loop=knee_loop,
+        ankle_correspondence=correspondence,
+        lower_leg=lower_leg,
+        lower_leg_subdivision=subdivision,
+        lower_leg_metadata=lower_leg_metadata,
+        attachment_diagnostics={
+            "paired_squared_residual": residual,
+            "lower_leg_loop_direction": "forward" if direction == 0 else "reversed",
+            "cyclic_offset": int(shift),
+        },
+        vertex_chart_face_indices=chart_faces,
+        vertex_chart_barycentric=chart_weights,
+        foot_native_chart_face_indices=reference.vertex_chart_face_indices,
+        foot_native_chart_barycentric=reference.vertex_chart_barycentric,
+        foot_native_vertices=reference.native_vertices,
+        foot_native_faces=reference.native_faces,
+        raw_supr_to_reference=reference.raw_supr_to_reference,
+        reference_to_raw_supr=reference.reference_to_raw_supr,
+        foot_dense_vertex_source_indices=reference.dense_vertex_source_indices,
+        foot_dense_vertex_source_weights=reference.dense_vertex_source_weights,
+        foot_dense_face_parent_indices=reference.dense_face_parent_indices,
+        longitudinal_vertex_labels=longitudinal_vertices,
+        longitudinal_face_labels=longitudinal_faces,
+        surface_vertex_labels=surface_vertices,
+        surface_face_labels=surface_faces,
+        component_vertex_labels=component_vertices,
+        component_face_labels=component_faces,
+        landmarks=landmarks,
+        foot_joint_names=reference.joint_names,
+        foot_reference_joints=reference.reference_joints,
+        lower_leg_joint_names=("right_knee", "right_ankle", "right_foot"),
+        lower_leg_joint_source_indices=joint_indices,
+        lower_leg_reference_joints=lower_leg.source_joints_reference[joint_indices],
+        anatomical_frame=frame,
+        digest=array_digest(vertices, faces),
+        topology_digest=topology_digest(faces),
+    )

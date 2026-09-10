@@ -519,6 +519,123 @@ Load either colored region PLY to inspect transfer. The same colors must stay
 on the same anatomical parts for every shoe. `--overwrite` replaces only these
 known artifacts and leaves unrelated files intact.
 
+## Fitted-foot lower-leg and collar fitting
+
+This GPU stage attaches a near-neutral male SUPR shank to each accepted dense
+fitted foot. The accepted foot is never moved or reshaped. It first searches
+ankle pitch and roll so the leg exits naturally through the shoe opening. Only
+when pose is insufficient may the first ten full-body SUPR betas make a modest
+shape correction. Global beta, length and cross-sectional girth limits prevent
+the optimizer from manufacturing an unnaturally thin collision-free leg.
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_lower_leg_attachment.py \
+  --anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
+  --preparation-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/shoe_preparation \
+  --support-fit-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/support_fit \
+  --full-body-supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male.npy \
+  --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/lower_leg_attachment \
+  --overwrite
+```
+
+For each shoe, the runner writes a joined foot-and-leg surface, a colored
+version, an overlay and JSON diagnostics. Red means that the bridge or lower
+leg physically intersects a non-footbed shoe triangle. Passing through empty
+opening space is allowed; no closed-volume inside/outside assumption is made.
+If natural pose and shape limits cannot remove every intersection, the runner
+saves the best natural result as `residual_collar_intersections` instead of
+over-thinning the shaft. This is a representative lower leg, not an inferred
+wearer's calf.
+
+## Extended foot-and-lower-leg anatomical surface
+
+This CPU-only stage labels the complete joined anatomy without rerunning SUPR
+or changing the accepted foot, leg pose, or leg shape:
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_extended_anatomical_surface.py \
+  --anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
+  --lower-leg-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/lower_leg_attachment \
+  --full-body-supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male.npy \
+  --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/extended_anatomical_surface \
+  --overwrite
+```
+
+The neutral reference and all 16 fitted instances share exactly 6,951 vertices
+and 13,832 faces. The original 4,151-vertex dense foot remains the unchanged
+prefix. Stable IDs transfer foot, ankle-transition, lower-shaft, calf and
+upper-shaft anatomy to every shoe. Separate maps describe longitudinal anatomy,
+surface direction and geometry component. A point anywhere on the joined skin
+is represented by an extended face ID and three barycentric weights.
+
+Outputs are written below `extended_anatomical_surface/reference` and one
+matching directory per shoe. The three `regions_*.ply` files verify that the
+same colors remain on the same anatomy. This is the accepted surface input for
+future volumetric work; it does not close the knee or create tetrahedra.
+
+## Canonical foot-and-lower-leg anatomical volume
+
+Checkpoint 10 preserves the Checkpoint 9 dense specialised foot, attaches a
+neutral male SUPR lower leg at its ankle opening, and uses the joined surface
+as the inner boundary of one shared tetrahedral reference domain `A`. Install
+its optional CPU dependencies once:
+
+The current neutral SUPR foot contains self-intersecting forefoot/toe
+triangles, so conforming tetrahedralization stops during preflight. The collar
+surface checkpoint above is usable now; the volume requires a separately
+reviewed computational-boundary repair without changing Checkpoints 8–9.
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python -m pip install -e ".[volume]"
+```
+
+Then run:
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_anatomical_volume.py \
+  --anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
+  --full-body-supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male.npy \
+  --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_volume \
+  --overwrite
+```
+
+The runner validates the saved Checkpoint 9 reference rather than rebuilding
+it. The first 4,151 vertices and 8,240 faces remain exactly unchanged. The
+full-body donor supplies only a rigidly aligned shank: its donor foot is
+discarded, the shank is subdivided twice, and a deterministic 60-point bridge
+joins the two ankle loops. A separately labelled cap closes the remaining
+68-point knee opening. The fixed fourth-order superellipsoid has bounds
+`X=[-0.40,1.30]`, `Y=[-2.05,0.40]`, and `Z=[-0.48,0.48]`. Gmsh 4.15.2 fills
+only the space between the joined anatomy and this envelope.
+
+The sparse finite-element solve assigns `r=0` to the real anatomical skin and
+`r=1` to the outer envelope. The computational knee-cap center has a natural
+boundary condition and the cap is never presented as skin. Values between
+zero and one form smooth layers around the foot and lower leg; `r` is a
+normalized harmonic coordinate, not a distance in millimetres. A volume
+position is represented by a tetrahedron ID and four barycentric weights.
+Checkpoint 8's foot face IDs remain unchanged on the `r=0` boundary; bridge
+and lower-leg charts are appended.
+
+The output is one reference, not one volume per shoe:
+
+```text
+anatomical_volume/reference/
+├── canonical_volume.json
+├── canonical_volume.npz
+├── canonical_volume.vtk
+├── inner_anatomical_boundary.ply
+├── outer_envelope.ply
+└── boundary_regions.ply
+```
+
+Open `canonical_volume.vtk` in ParaView to inspect the tetrahedra and `r`
+field. `boundary_regions.ply` separately colors the specialised foot, ankle
+transition, lower-leg skin, computational knee cap, and outer envelope.
+
 ## Current limitations
 
 The selected canvas footbed contains one genuine rectangular source-topology
