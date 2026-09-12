@@ -18,6 +18,7 @@ test = ["pytest>=8"]
 fitting = ["torch>=1.13"]
 volume = [
     "gmsh==4.15.2",
+    "pymeshfix==0.18.1",
     "scipy>=1.10",
 ]
 

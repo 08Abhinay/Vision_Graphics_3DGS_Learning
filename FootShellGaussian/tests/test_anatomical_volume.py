@@ -2,36 +2,43 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 from pathlib import Path
 import inspect
+import shutil
 
 import numpy as np
 import pytest
 
 from foot_prior.anatomical_volume import (
-    DENSE_FACE_COUNT,
-    DENSE_VERTEX_COUNT,
+    BOUNDARY_FOOT_SKIN,
     ENVELOPE_CENTER,
     ENVELOPE_POWER,
     ENVELOPE_RADII,
-    _build_extended_anatomical_surface,
+    EXTENDED_FACE_COUNT,
+    EXTENDED_VERTEX_COUNT,
+    _build_computational_boundary,
     _close_truncation,
-    _directed_boundary_loop,
-    _load_checkpoint_nine_reference,
+    _load_extended_reference,
+    _surface_coordinates,
+    build_instance_boundary_target,
     build_outer_envelope,
+    continue_instance_volume,
+    load_canonical_anatomical_volume,
+    load_instance_volume_problem,
     map_volume_coordinates,
     orient_tetrahedra_positive,
     solve_harmonic_r,
 )
-from foot_prior.mesh import TriangleMesh
-from foot_prior.supr_lower_leg import attach_lower_leg_to_fitted_dense_foot
+from foot_prior.mesh import load_triangle_mesh
 
 
 REFERENCE_ROOT = Path(
-    "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface"
+    "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/extended_anatomical_surface"
 )
-FULL_BODY_MODEL = Path(
-    "/storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male.npy"
+VOLUME_ROOT = Path(
+    "/home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_volume"
 )
 
 
@@ -87,74 +94,38 @@ def test_outer_envelope_is_frozen_and_deterministic() -> None:
 
 
 @pytest.mark.skipif(
-    not REFERENCE_ROOT.is_dir() or not FULL_BODY_MODEL.is_file(),
-    reason="Checkpoint 9 reference or full-body SUPR donor absent",
+    not REFERENCE_ROOT.is_dir(),
+    reason="extended canonical anatomical reference absent",
 )
-def test_extended_surface_preserves_foot_and_has_one_knee_boundary() -> None:
-    reference = _load_checkpoint_nine_reference(REFERENCE_ROOT)
-    assert reference.vertices.shape == (DENSE_VERTEX_COUNT, 3)
-    assert reference.faces.shape == (DENSE_FACE_COUNT, 3)
-    first = _build_extended_anatomical_surface(reference, FULL_BODY_MODEL)
-    second = _build_extended_anatomical_surface(reference, FULL_BODY_MODEL)
-    np.testing.assert_array_equal(first.vertices, second.vertices)
-    np.testing.assert_array_equal(first.faces, second.faces)
-    np.testing.assert_array_equal(first.vertices[:DENSE_VERTEX_COUNT], reference.vertices)
-    np.testing.assert_array_equal(first.faces[:DENSE_FACE_COUNT], reference.faces)
-    assert len(first.lower_leg.distal_boundary_vertex_indices) == 15
-    assert len(first.lower_leg.proximal_boundary_vertex_indices) == 17
-    assert len(first.lower_leg_indices) == 2_800
-    assert len(first.bridge_face_indices) == 120
-    assert len(first.knee_loop) == 68
-    np.testing.assert_array_equal(_directed_boundary_loop(first.faces), first.knee_loop)
+def test_computational_boundary_repairs_without_changing_reference() -> None:
+    reference = _load_extended_reference(REFERENCE_ROOT)
+    original_vertices = reference.vertices.copy()
+    original_faces = reference.faces.copy()
+    assert reference.vertices.shape == (EXTENDED_VERTEX_COUNT, 3)
+    assert reference.faces.shape == (EXTENDED_FACE_COUNT, 3)
 
-    closed_vertices, cap_faces, cap_index = _close_truncation(
-        first.vertices, first.faces, first.knee_loop
-    )
-    np.testing.assert_array_equal(closed_vertices[:DENSE_VERTEX_COUNT], reference.vertices)
-    np.testing.assert_array_equal(
-        np.vstack((first.faces, cap_faces))[:DENSE_FACE_COUNT], reference.faces
-    )
-    assert cap_index == len(first.vertices)
-    assert len(cap_faces) == 68
+    computational = _build_computational_boundary(reference)
+    np.testing.assert_array_equal(reference.vertices, original_vertices)
+    np.testing.assert_array_equal(reference.faces, original_faces)
+    assert computational.vertices.shape == (6_904, 3)
+    assert computational.faces.shape == (13_804, 3)
+    assert len(computational.knee_cap_face_indices) == 68
 
-    broken = reference.faces[:-1]
-    with pytest.raises(ValueError):
-        _directed_boundary_loop(broken)
-
-    envelope_value = np.sum(
-        np.abs((closed_vertices - ENVELOPE_CENTER) / ENVELOPE_RADII)
-        ** ENVELOPE_POWER,
-        axis=1,
+    canonical_vertices, cap_faces, _ = _close_truncation(
+        reference.vertices, reference.faces, reference.knee_loop
     )
-    assert float(np.max(envelope_value)) < 1.0
-
-    leg_offset = DENSE_VERTEX_COUNT
-    correspondence = first.ankle_correspondence.copy()
-    correspondence[:, 1] -= leg_offset
-    attached = attach_lower_leg_to_fitted_dense_foot(
-        TriangleMesh(reference.vertices, reference.faces),
-        reference.vertices,
-        first.vertices[first.lower_leg_indices],
-        first.faces[first.lower_leg_face_indices] - leg_offset,
-        reference.ankle_loop,
-        correspondence,
+    canonical_faces = np.vstack((reference.faces, cap_faces))
+    closest, distances, face_indices, barycentric = _surface_coordinates(
+        computational.vertices, canonical_vertices, canonical_faces
     )
-    np.testing.assert_array_equal(
-        attached.mesh.vertices[:DENSE_VERTEX_COUNT], reference.vertices
+    reconstructed = np.einsum(
+        "ni,nij->nj",
+        barycentric,
+        canonical_vertices[canonical_faces[face_indices]],
     )
-    np.testing.assert_allclose(
-        attached.mesh.vertices[DENSE_VERTEX_COUNT:],
-        first.vertices[DENSE_VERTEX_COUNT:],
-        atol=1.0e-14,
-        rtol=0.0,
-    )
-    np.testing.assert_array_equal(attached.mesh.faces, first.faces)
-    np.testing.assert_allclose(
-        attached.canonical_leg_to_fitted_ankle,
-        np.eye(4),
-        atol=1.0e-14,
-        rtol=0.0,
-    )
+    np.testing.assert_allclose(reconstructed, closest, atol=1.0e-12, rtol=0.0)
+    np.testing.assert_allclose(barycentric.sum(axis=1), np.ones(len(barycentric)))
+    assert float(np.max(distances)) < 0.014
 
 
 def test_installed_gmsh_classification_api_matches_checkpoint() -> None:
@@ -164,3 +135,119 @@ def test_installed_gmsh_classification_api_matches_checkpoint() -> None:
     assert "boundary" in parameters
     assert "forReparametrization" in parameters
     assert "curveAngle" in parameters
+
+
+def test_installed_pymeshfix_api_matches_checkpoint() -> None:
+    pymeshfix = pytest.importorskip("pymeshfix")
+    assert pymeshfix.__version__ == "0.18.1"
+    assert hasattr(pymeshfix.PyTMesh, "strong_intersection_removal")
+
+
+@pytest.mark.skipif(
+    not (VOLUME_ROOT / "reference" / "canonical_volume.npz").is_file(),
+    reason="canonical anatomical volume absent",
+)
+def test_saved_canonical_volume_loads_with_exact_boundary_topology() -> None:
+    volume = load_canonical_anatomical_volume(VOLUME_ROOT)
+    assert volume.computational_inner_vertex_indices.shape == (8_224,)
+    assert volume.computational_inner_faces.shape == (16_444, 3)
+    np.testing.assert_array_equal(
+        volume.computational_inner_vertex_indices,
+        np.arange(8_224, dtype=np.int64),
+    )
+
+
+@pytest.mark.skipif(
+    not (REFERENCE_ROOT / "canvas_shoe" / "foot_lower_leg.ply").is_file(),
+    reason="fitted canvas anatomy absent",
+)
+def test_canvas_boundary_target_preserves_correspondence_and_reports_toes() -> None:
+    volume = load_canonical_anatomical_volume(VOLUME_ROOT)
+    reference = _load_extended_reference(REFERENCE_ROOT)
+    fitted = load_triangle_mesh(REFERENCE_ROOT / "canvas_shoe" / "foot_lower_leg.ply")
+    target = build_instance_boundary_target(volume, reference, fitted)
+
+    assert target.status == "ready_requires_untangling"
+    assert target.vertices.shape == (8_224, 3)
+    np.testing.assert_array_equal(target.faces, volume.computational_inner_faces)
+    assert len(target.intersecting_face_pairs) > 0
+    np.testing.assert_array_equal(
+        np.unique(target.intersecting_face_pairs), target.intersecting_face_indices
+    )
+    assert np.all(
+        target.face_labels[target.intersecting_face_indices] == BOUNDARY_FOOT_SKIN
+    )
+    assert float(np.max(target.reverse_distances)) <= 2.0 * target.surface_resolution
+
+
+@pytest.mark.skipif(
+    not (VOLUME_ROOT / "sandal_1" / "boundary_target.npz").is_file(),
+    reason="saved sandal boundary target absent",
+)
+def test_sandal_instance_volume_problem_loads_recorded_intersections() -> None:
+    problem = load_instance_volume_problem(VOLUME_ROOT, REFERENCE_ROOT, "sandal_1")
+
+    assert problem.shoe_name == "sandal_1"
+    assert problem.boundary_target.status == "ready_requires_untangling"
+    assert problem.boundary_target.vertices.shape == (8_224, 3)
+    assert problem.boundary_target.intersecting_face_pairs.shape == (2, 2)
+    np.testing.assert_array_equal(
+        problem.boundary_target.intersecting_face_indices,
+        np.asarray((5732, 5816, 5826), dtype=np.int64),
+    )
+
+
+@pytest.mark.skipif(
+    not (VOLUME_ROOT / "sandal_1" / "boundary_target.npz").is_file(),
+    reason="saved sandal boundary target absent",
+)
+def test_instance_volume_problem_rejects_mismatched_target_digest(
+    tmp_path: Path,
+) -> None:
+    volume_root = tmp_path / "anatomical_volume"
+    volume_root.mkdir()
+    (volume_root / "reference").symlink_to(
+        VOLUME_ROOT / "reference", target_is_directory=True
+    )
+    target = volume_root / "sandal_1"
+    target.mkdir()
+    for name in ("boundary_target.json", "boundary_target.npz"):
+        shutil.copyfile(VOLUME_ROOT / "sandal_1" / name, target / name)
+    payload = json.loads((target / "boundary_target.json").read_text(encoding="utf-8"))
+    payload["geometry"]["geometry_sha256"] = "0" * 64
+    (target / "boundary_target.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="digest validation failed"):
+        load_instance_volume_problem(volume_root, REFERENCE_ROOT, "sandal_1")
+
+
+@pytest.mark.skipif(
+    not (VOLUME_ROOT / "sandal_1" / "boundary_target.npz").is_file(),
+    reason="saved sandal boundary target absent",
+)
+def test_identity_instance_volume_continuation_is_exact() -> None:
+    problem = load_instance_volume_problem(VOLUME_ROOT, REFERENCE_ROOT, "sandal_1")
+    volume = problem.canonical_volume
+    identity_target = replace(
+        problem.boundary_target,
+        vertices=volume.volume_vertices[
+            volume.computational_inner_vertex_indices
+        ].copy(),
+        intersecting_face_pairs=np.empty((0, 2), dtype=np.int64),
+        intersecting_face_indices=np.empty(0, dtype=np.int64),
+        status="ready",
+        geometry_digest="identity",
+    )
+    identity_problem = replace(problem, boundary_target=identity_target)
+
+    result = continue_instance_volume(identity_problem)
+
+    assert result.status == "baseline_reached_target"
+    assert result.reached_alpha == 1.0
+    np.testing.assert_array_equal(result.volume_vertices, volume.volume_vertices)
+    np.testing.assert_array_equal(
+        result.jacobian_determinants,
+        np.ones(len(volume.tetrahedra), dtype=np.float64),
+    )

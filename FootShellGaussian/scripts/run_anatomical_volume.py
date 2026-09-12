@@ -28,7 +28,7 @@ ARTIFACT_NAMES = (
     "canonical_volume.json",
     "canonical_volume.npz",
     "canonical_volume.vtk",
-    "inner_anatomical_boundary.ply",
+    "computational_inner_boundary.ply",
     "outer_envelope.ply",
     "boundary_regions.ply",
 )
@@ -53,8 +53,9 @@ def parse_args() -> argparse.Namespace:
             "coordinate."
         )
     )
-    parser.add_argument("--anatomical-surface-root", required=True, type=Path)
-    parser.add_argument("--full-body-supr-model", required=True, type=Path)
+    parser.add_argument(
+        "--extended-anatomical-surface-root", required=True, type=Path
+    )
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument(
         "--overwrite",
@@ -89,6 +90,22 @@ def _boundary_regions_mesh(result: CanonicalAnatomicalVolume) -> TriangleMesh:
     faces = np.arange(len(vertices), dtype=np.int64).reshape(-1, 3)
     colors = np.repeat(BOUNDARY_COLORS[result.boundary_labels], 3, axis=0)
     return TriangleMesh(vertices, faces, colors)
+
+
+def _computational_boundary_mesh(
+    result: CanonicalAnatomicalVolume,
+) -> TriangleMesh:
+    mesh = result.computational_inner_mesh
+    resolution = float(result.diagnostics["repair"]["surface_resolution"])
+    distances = result.computational_to_canonical_distances
+    colors = np.tile(np.asarray((55, 120, 225, 255), dtype=np.uint8), (len(mesh.vertices), 1))
+    colors[distances > 0.05 * resolution] = np.asarray(
+        (240, 205, 55, 255), dtype=np.uint8
+    )
+    colors[distances > 0.5 * resolution] = np.asarray(
+        (210, 55, 175, 255), dtype=np.uint8
+    )
+    return TriangleMesh(mesh.vertices, mesh.faces, colors)
 
 
 def _write_vtk(path: Path, result: CanonicalAnatomicalVolume) -> None:
@@ -141,18 +158,42 @@ def _write_artifacts(
         boundary_label_names=np.asarray(BOUNDARY_LABEL_NAMES),
         harmonic_r=result.harmonic_r,
         harmonic_r_gradient=result.harmonic_r_gradient,
-        dense_foot_to_volume_indices=result.dense_foot_to_volume_indices,
-        lower_leg_to_volume_indices=result.lower_leg_to_volume_indices,
-        foot_boundary_face_indices=result.foot_boundary_face_indices,
-        ankle_transition_face_indices=result.ankle_transition_face_indices,
-        lower_leg_boundary_face_indices=result.lower_leg_boundary_face_indices,
-        knee_cap_indices=result.knee_cap_indices,
-        knee_cap_vertex_index=np.asarray(result.knee_cap_vertex_index),
-        dense_knee_loop_indices=result.dense_knee_loop_indices,
-        ankle_loop_correspondence=result.ankle_loop_correspondence,
-        lower_leg_source_vertex_indices=result.lower_leg_source_vertex_indices,
-        lower_leg_source_face_indices=result.lower_leg_source_face_indices,
-        body_to_reference=result.body_to_reference,
+        computational_inner_vertex_indices=(
+            result.computational_inner_vertex_indices
+        ),
+        computational_inner_faces=result.computational_inner_faces,
+        computational_inner_face_labels=(
+            result.computational_inner_face_labels
+        ),
+        zero_boundary_vertex_indices=result.zero_boundary_vertex_indices,
+        knee_cap_face_indices=result.knee_cap_face_indices,
+        knee_cap_natural_vertex_indices=(
+            result.knee_cap_natural_vertex_indices
+        ),
+        computational_to_canonical_face_indices=(
+            result.computational_to_canonical_face_indices
+        ),
+        computational_to_canonical_barycentric=(
+            result.computational_to_canonical_barycentric
+        ),
+        computational_to_canonical_distances=(
+            result.computational_to_canonical_distances
+        ),
+        canonical_to_computational_face_indices=(
+            result.canonical_to_computational_face_indices
+        ),
+        canonical_to_computational_barycentric=(
+            result.canonical_to_computational_barycentric
+        ),
+        canonical_to_computational_distances=(
+            result.canonical_to_computational_distances
+        ),
+        initial_self_intersection_pairs=(
+            result.initial_self_intersection_pairs
+        ),
+        repair_zone_canonical_vertex_indices=(
+            result.repair_zone_canonical_vertex_indices
+        ),
         outer_vertex_indices=result.outer_vertex_indices,
         tetrahedron_signed_volumes=result.tetrahedron_signed_volumes,
         tetrahedron_mean_ratio_quality=result.tetrahedron_mean_ratio_quality,
@@ -164,8 +205,8 @@ def _write_artifacts(
     )
     _write_vtk(directory / "canonical_volume.vtk", result)
     save_triangle_mesh(
-        directory / "inner_anatomical_boundary.ply",
-        result.inner_anatomical_mesh,
+        directory / "computational_inner_boundary.ply",
+        _computational_boundary_mesh(result),
     )
     first_outer = int(result.outer_vertex_indices[0])
     outer_faces = result.boundary_faces[
@@ -182,12 +223,11 @@ def _write_artifacts(
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
-    surface_root = args.anatomical_surface_root.expanduser().resolve(strict=True)
+    surface_root = (
+        args.extended_anatomical_surface_root.expanduser().resolve(strict=True)
+    )
     if not surface_root.is_dir():
         raise NotADirectoryError(surface_root)
-    full_body_model = args.full_body_supr_model.expanduser().resolve(strict=True)
-    if not full_body_model.is_file():
-        raise FileNotFoundError(full_body_model)
     output_root = args.output_root.expanduser().resolve()
     destination = output_root / "reference"
     existing = [destination / name for name in ARTIFACT_NAMES]
@@ -197,25 +237,29 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "canonical-volume artifacts already exist; pass --overwrite to replace them"
         )
 
-    result = build_canonical_anatomical_volume(surface_root, full_body_model)
+    result = build_canonical_anatomical_volume(surface_root)
     reference_root = surface_root / "reference"
     payload = result.to_dict()
     payload["input"] = {
-        "anatomical_surface_root": str(surface_root),
-        "canonical_surface_json": str(reference_root / "canonical_surface.json"),
-        "canonical_surface_npz": str(reference_root / "canonical_surface.npz"),
-        "neutral_dense_ply": str(reference_root / "neutral_dense.ply"),
-        "canonical_surface_json_sha256": _file_digest(
-            reference_root / "canonical_surface.json"
+        "extended_anatomical_surface_root": str(surface_root),
+        "canonical_extended_surface_json": str(
+            reference_root / "canonical_extended_surface.json"
         ),
-        "canonical_surface_npz_sha256": _file_digest(
-            reference_root / "canonical_surface.npz"
+        "canonical_extended_surface_npz": str(
+            reference_root / "canonical_extended_surface.npz"
         ),
-        "neutral_dense_ply_sha256": _file_digest(
-            reference_root / "neutral_dense.ply"
+        "neutral_foot_lower_leg_ply": str(
+            reference_root / "neutral_foot_lower_leg.ply"
         ),
-        "full_body_supr_model": str(full_body_model),
-        "full_body_supr_model_sha256": _file_digest(full_body_model),
+        "canonical_extended_surface_json_sha256": _file_digest(
+            reference_root / "canonical_extended_surface.json"
+        ),
+        "canonical_extended_surface_npz_sha256": _file_digest(
+            reference_root / "canonical_extended_surface.npz"
+        ),
+        "neutral_foot_lower_leg_ply_sha256": _file_digest(
+            reference_root / "neutral_foot_lower_leg.ply"
+        ),
     }
 
     output_root.parent.mkdir(parents=True, exist_ok=True)

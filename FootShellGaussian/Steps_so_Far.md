@@ -775,14 +775,11 @@ The knee remains open and no tetrahedral volume is created in this step.
 
 ## Step 17: Build the canonical foot-and-lower-leg anatomical volume
 
-Current limitation: the neutral SUPR foot contains intersecting toe/forefoot
-triangles. Gmsh cannot use that surface as an exact conforming boundary. Keep
-the accepted Checkpoints 8–9 surface unchanged and resolve the computational
-volume boundary before treating this step as complete.
-
-This CPU-only step runs once on the shared neutral dense reference. It does not
-process the individual shoe directories and does not rerun fitting. Install the
-optional dependency group once if needed:
+This CPU-only step runs once from the accepted extended anatomical surface. It
+does not process individual shoe directories, rebuild SUPR, or rerun fitting.
+The exact canonical anatomy remains immutable; a separately registered
+computational foot boundary removes the neutral toe self-overlap before Gmsh.
+Install the optional dependency group once if needed:
 
 ```bash
 cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian
@@ -795,21 +792,22 @@ Build the volume:
 ```bash
 /home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
   scripts/run_anatomical_volume.py \
-  --anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_surface \
-  --full-body-supr-model /storage/Abhinay/Shell_Gaussian/baselines/SUPR/data/supr_male.npy \
+  --extended-anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/extended_anatomical_surface \
   --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_volume \
   --overwrite
 ```
 
-The runner validates the existing `anatomical_surface/reference`, keeps its
-4,151 dense foot vertices and 8,240 faces unchanged, and extracts only the
-neutral male shank from the full-body SUPR donor. It aligns the shank rigidly,
-subdivides it twice, and joins its 60-vertex ankle loop to the foot with a
-deterministic bridge. It closes the remaining 68-vertex knee opening with a
-labelled computational cap, then asks Gmsh to fill the space between this
-anatomy and the fixed envelope. The smooth coordinate is `r=0` on the foot,
-bridge and real lower-leg skin and `r=1` on the envelope. The knee cap is not
-anatomical skin and its center is not assigned a fixed `r` value.
+The runner validates `extended_anatomical_surface/reference`. PyMeshFix repairs
+only a closed copy of the 266-vertex native foot; the temporary ankle cap is
+then removed, the computational foot is subdivided twice, and the unchanged
+dense lower leg is reattached. Two-way face-and-barycentric maps preserve the
+link to the authoritative 6,951-vertex anatomy. Gmsh retriangulates only this
+disposable inner copy at a controlled resolution, after which the mappings and
+fidelity checks are recomputed. The accepted computational boundary and fixed
+outer envelope are then preserved exactly during tetrahedralization. The
+smooth coordinate is `r=0` on the foot, bridge and real lower-leg skin and
+`r=1` on the envelope. The knee cap is not anatomical skin and its interior
+vertices are not assigned a fixed `r` value.
 
 The result is:
 
@@ -818,15 +816,77 @@ anatomical_volume/reference/
 ├── canonical_volume.json
 ├── canonical_volume.npz
 ├── canonical_volume.vtk
-├── inner_anatomical_boundary.ply
+├── computational_inner_boundary.ply
 ├── outer_envelope.ply
 └── boundary_regions.ply
 ```
 
 Inspect `canonical_volume.vtk` in ParaView with the `harmonic_r` scalar. Values
-should change smoothly from zero at the foot to one at the outside. Inspect
-`boundary_regions.ply` to distinguish the foot, ankle transition, lower leg,
-temporary knee cap, and outer envelope.
+should change smoothly from zero at the body boundary to one at the outside.
+Inspect `computational_inner_boundary.ply` for repair displacement and
+`boundary_regions.ply` for the foot, ankle transition, lower leg, temporary
+knee cap, and outer envelope.
+
+## Step 18: Prepare each fitted anatomical boundary target
+
+Checkpoint 11-A evaluates the canonical computational boundary's saved
+face-and-barycentric coordinates on every fitted foot-and-lower-leg surface:
+
+```bash
+/home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+  scripts/run_instance_anatomical_volume.py \
+  --anatomical-volume-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_volume \
+  --extended-anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/extended_anatomical_surface \
+  --overwrite
+```
+
+With no positional shoe names, all accepted normal-shoe directories are
+validated first and then written in sorted order. The output is:
+
+```text
+anatomical_volume/<shoe>/
+├── boundary_target.json
+├── boundary_target.npz
+├── computational_boundary_target.ply
+└── boundary_target_overlay.ply
+```
+
+The target retains the canonical 8,224-vertex/16,444-face computational
+topology. Blue is the target proxy, red marks exact target self-intersections,
+purple is the computational knee cap, and gray is the unchanged authoritative
+fitted anatomy. Expected foot-only toe intersections are saved with
+`status="ready_requires_untangling"`; bridge, lower-leg, or cap intersections
+fail. The frozen-envelope test is diagnostic at this checkpoint.
+
+No tetrahedron moves here. Checkpoint 11-B will use these soft targets to solve
+the nearest fold-free inner boundary and the complete instance volume together.
+
+## Step 19: Build Checkpoint 11-B2 continuation warm starts
+
+Checkpoint 11-B1 loads and cross-validates the canonical volume, each saved
+11-A target, and its authoritative fitted anatomy. Checkpoint 11-B2 reuses one
+canonical finite-element factorization and advances from the canonical volume
+toward each target while the outer envelope remains exactly fixed.
+
+Run the current 15-shoe scope in `tmux` and exclude `sneaker_vibe`:
+
+```bash
+tmux new-session -d -s instance-volume-continuation \
+  'cd /storage/Abhinay/Shell_Gaussian/FootShellGaussian && \
+  /home/ab5298/anaconda3/envs/shellgaussianenv/bin/python \
+    scripts/run_instance_volume_deformation.py \
+    --anatomical-volume-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_volume \
+    --extended-anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/extended_anatomical_surface \
+    --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/instance_anatomical_volume \
+    --exclude sneaker_vibe \
+    --overwrite'
+```
+
+The two per-shoe outputs, `continuation_state.json` and
+`continuation_state.npz`, contain only the last valid baseline state and its
+step history. `baseline_reached_target` and `needs_11_b3` are intermediate
+statuses; neither represents a final cleaned volume. The next checkpoint must
+jointly optimize the boundary and interior for states that stopped early.
 
 ## Failure rules
 
@@ -842,9 +902,10 @@ temporary knee cap, and outer envelope.
 
 ## What comes next
 
-The current accepted anatomical endpoint is the shared foot-and-lower-leg
-surface and its exact correspondence across all fitted instances. The next
-checkpoint will construct a valid computational tetrahedral boundary around
-that reference, followed later by the per-instance forward and inverse volume
-mappings. Toe articulation and other localized controls remain optional future
-containment work. High-heel SUPR fitting remains outside the current scope.
+Checkpoint 11-B2 provides a valid continuation warm start, but it deliberately
+stops before an invalid target step. Checkpoint 11-B3 must jointly untangle the
+inner boundary and optimize the tetrahedral interior for every state marked
+`needs_11_b3`. Later steps will perform final bounded-distortion validation and
+implement the forward and inverse volume mappings. Toe articulation and other
+localized controls remain optional future containment work. High-heel SUPR
+fitting remains outside the current scope.
