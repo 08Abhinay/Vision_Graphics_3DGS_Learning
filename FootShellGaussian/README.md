@@ -677,7 +677,7 @@ computational knee cap purple. This is a soft boundary target for the next
 fold-free volume solve; it is not yet `chi_i`, `Phi_i`, or a valid deformed
 tetrahedral volume.
 
-## Instance-volume continuation warm starts
+## Instance-volume deformation
 
 Checkpoints 11-B1 and 11-B2 validate each saved boundary target against the
 canonical volume and authoritative fitted anatomy, then reuse the canonical
@@ -686,6 +686,14 @@ boundary follows the interpolated 11-A target, the outer envelope remains
 exactly fixed, and the same tetrahedron IDs are retained. A trial step is
 rejected if a tetrahedron approaches inversion, an inner face degenerates, the
 inner boundary leaves the envelope, or a boundary intersection is detected.
+
+Checkpoint 11-B3 starts from the robust portion of that continuation. It first
+uses localized CPU-only bounded-distortion optimization around intersecting
+faces and weak boundary tetrahedra, then fixes the corrected computational
+surface while solving the tetrahedral interior. Exact 11-A targets are retained
+when feasible; otherwise only the computational copy may receive a recorded
+correction of at most half the fitted surface resolution. The authoritative
+anatomy, outer envelope, connectivity, and vertex correspondence never change.
 
 Run the accepted 15-shoe batch in `tmux`, explicitly excluding the rejected
 `sneaker_vibe` input:
@@ -702,18 +710,27 @@ tmux new-session -d -s instance-volume-continuation \
     --overwrite'
 ```
 
-Each selected shoe receives only an intermediate warm start:
+Use `--stop-after 11-b2` when only the intermediate continuation is wanted.
+The default completes B3 and writes:
 
 ```text
 instance_anatomical_volume/<shoe>/
 ├── continuation_state.json
-└── continuation_state.npz
+├── continuation_state.npz
+├── instance_volume.json
+├── instance_volume.npz
+└── instance_volume.vtk
 ```
 
 `baseline_reached_target` means the simple smooth baseline reached the complete
 11-A target. `needs_11_b3` means it stopped at the last valid interpolation
-step. Neither status is a final cleaned instance volume: joint untangling,
-bounded-distortion acceptance, and `chi_i`/`Phi_i` remain deferred.
+step. B3 reports `final_exact_target`, `final_corrected_target`, or
+`failed_11_b3`. A failed record is diagnostic only and has no final NPZ or VTK.
+The forward and inverse `chi_i`/`Phi_i` operations remain deferred.
+
+Use `--resume` to reuse only complete states whose configuration, digests,
+arrays, and geometry all revalidate. It is mutually exclusive with
+`--overwrite`; incompatible or partial states require an explicit overwrite.
 
 ## Current limitations
 

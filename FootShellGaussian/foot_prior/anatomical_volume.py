@@ -24,7 +24,11 @@ from .anatomy import (
     directed_boundary_loop as _directed_boundary_loop,
     topology_digest as _topology_digest,
 )
-from .cavity import _closest_points_on_triangles, _find_collision_pairs
+from .cavity import (
+    _closest_points_on_triangles,
+    _find_collision_pairs,
+    _find_self_collision_pairs,
+)
 from .mesh import TriangleMesh, load_triangle_mesh
 from .supr_foot import build_supr_mesh_subdivision
 
@@ -391,19 +395,7 @@ class InstanceVolumeContinuation:
             "reached_alpha": self.reached_alpha,
             "accepted_alphas": self.accepted_alphas.tolist(),
             "stopping_reason": self.stopping_reason,
-            "configuration": {
-                "initial_step": INSTANCE_CONTINUATION_INITIAL_STEP,
-                "minimum_step": INSTANCE_CONTINUATION_MINIMUM_STEP,
-                "jacobian_determinant_floor": (
-                    INSTANCE_JACOBIAN_DETERMINANT_FLOOR
-                ),
-                "outer_boundary": "fixed exactly to the canonical envelope",
-                "inner_boundary": (
-                    "linear interpolation from the canonical computational "
-                    "boundary to the Checkpoint 11-A target"
-                ),
-                "interior": "linear tetrahedral FEM smooth displacement",
-            },
+            "configuration": instance_continuation_configuration(),
             "counts": {
                 "volume_vertices": int(len(self.volume_vertices)),
                 "attempts": int(len(self.attempts)),
@@ -432,6 +424,22 @@ class InstanceVolumeContinuation:
                 "chi_i and Phi_i",
             ],
         }
+
+
+def instance_continuation_configuration() -> dict[str, Any]:
+    """Return the fixed Checkpoint 11-B2 continuation policy."""
+
+    return {
+        "initial_step": INSTANCE_CONTINUATION_INITIAL_STEP,
+        "minimum_step": INSTANCE_CONTINUATION_MINIMUM_STEP,
+        "jacobian_determinant_floor": INSTANCE_JACOBIAN_DETERMINANT_FLOOR,
+        "outer_boundary": "fixed exactly to the canonical envelope",
+        "inner_boundary": (
+            "linear interpolation from the canonical computational boundary "
+            "to the Checkpoint 11-A target"
+        ),
+        "interior": "linear tetrahedral FEM smooth displacement",
+    }
 
 
 @dataclass(frozen=True)
@@ -1110,27 +1118,12 @@ def _self_intersection_pairs(
     vertices: np.ndarray,
     faces: np.ndarray,
 ) -> np.ndarray:
-    triangles = np.asarray(vertices, dtype=np.float64)[faces]
-    indices = np.arange(len(faces), dtype=np.int64)
     scale = max(float(np.max(np.abs(vertices))), 1.0)
-    pairs = _find_collision_pairs(
-        triangles,
-        indices,
-        triangles,
-        indices,
+    return _find_self_collision_pairs(
+        np.asarray(vertices, dtype=np.float64),
+        np.asarray(faces, dtype=np.int64),
         512.0 * np.finfo(np.float64).eps * scale,
     )
-    pairs = pairs[pairs[:, 0] < pairs[:, 1]]
-    if len(pairs) == 0:
-        return pairs
-    disjoint = np.asarray(
-        [
-            not np.intersect1d(faces[first], faces[second], assume_unique=False).size
-            for first, second in pairs
-        ],
-        dtype=bool,
-    )
-    return pairs[disjoint]
 
 
 def _expanded_face_region(

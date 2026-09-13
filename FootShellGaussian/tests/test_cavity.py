@@ -10,7 +10,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from foot_prior.cavity import CavityEvaluator, analyze_fitted_foot_cavity
+from foot_prior.cavity import (
+    CavityEvaluator,
+    _build_triangle_broad_phase,
+    _find_collision_pairs,
+    analyze_fitted_foot_cavity,
+)
 from foot_prior.mesh import TriangleMesh
 
 
@@ -24,6 +29,71 @@ SUPPORT_FIT_ROOT = Path(
     "support_fit_2"
 )
 RUNNER = PROJECT_ROOT / "scripts/run_cavity_analysis.py"
+
+
+@pytest.mark.parametrize(
+    ("second", "expected"),
+    [
+        (
+            ((0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (0.0, 1.0, 1.0)),
+            False,
+        ),
+        (
+            ((0.25, 0.25, -1.0), (0.25, 0.25, 1.0), (0.75, 0.25, 0.0)),
+            True,
+        ),
+        (
+            ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0), (1.0, 1.0, 0.0)),
+            True,
+        ),
+        (
+            ((0.25, 0.25, 0.0), (1.25, 0.25, 0.0), (0.25, 1.25, 0.0)),
+            True,
+        ),
+    ],
+)
+def test_spatial_broad_phase_preserves_exact_triangle_contacts(
+    second: tuple[tuple[float, float, float], ...], expected: bool
+) -> None:
+    first = np.asarray(
+        (((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),),
+        dtype=np.float64,
+    )
+    obstacle = np.asarray((second,), dtype=np.float64)
+    first_ids = np.asarray((7,), dtype=np.int64)
+    second_ids = np.asarray((11,), dtype=np.int64)
+    index = _build_triangle_broad_phase(obstacle, second_ids)
+    pairs = _find_collision_pairs(
+        first,
+        first_ids,
+        obstacle,
+        second_ids,
+        1.0e-14,
+        obstacle_broad_phase=index,
+    )
+    assert bool(len(pairs)) is expected
+    if expected:
+        np.testing.assert_array_equal(pairs, np.asarray(((7, 11),)))
+        reversed_pairs = _find_collision_pairs(
+            first[:, ::-1], first_ids, obstacle[:, ::-1], second_ids, 1.0e-14
+        )
+        np.testing.assert_array_equal(reversed_pairs, pairs)
+
+
+def test_spatial_broad_phase_deduplicates_repeated_face_ids() -> None:
+    triangle = np.asarray(
+        (((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),),
+        dtype=np.float64,
+    )
+    obstacles = np.repeat(triangle, 2, axis=0)
+    pairs = _find_collision_pairs(
+        triangle,
+        np.asarray((3,), dtype=np.int64),
+        obstacles,
+        np.asarray((9, 9), dtype=np.int64),
+        1.0e-14,
+    )
+    np.testing.assert_array_equal(pairs, np.asarray(((3, 9),)))
 
 
 def _quad(

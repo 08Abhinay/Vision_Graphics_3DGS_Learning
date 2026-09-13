@@ -878,6 +878,7 @@ tmux new-session -d -s instance-volume-continuation \
     --anatomical-volume-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/anatomical_volume \
     --extended-anatomical-surface-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/extended_anatomical_surface \
     --output-root /home/ab5298/Outputs/FootShellGaussian/golden_set_evaluation/instance_anatomical_volume \
+    --stop-after 11-b2 \
     --exclude sneaker_vibe \
     --overwrite'
 ```
@@ -887,6 +888,24 @@ The two per-shoe outputs, `continuation_state.json` and
 step history. `baseline_reached_target` and `needs_11_b3` are intermediate
 statuses; neither represents a final cleaned volume. The next checkpoint must
 jointly optimize the boundary and interior for states that stopped early.
+
+## Step 20: Finish Checkpoint 11-B3 bounded deformation
+
+The same runner now completes B3 by default. It selects a robust point on the
+B2 path, repairs only a deterministic local region around intersecting faces
+and weak surface tetrahedra, then fixes that computational surface while solving
+the tetrahedral interior. The outer envelope, tetrahedron connectivity, fitted
+anatomical surface, and 11-A target remain unchanged. When an exact target is
+not feasible, only the computational copy may move, by at most half the fitted
+surface resolution.
+
+Successful shoes add `instance_volume.json`, `instance_volume.npz`, and
+`instance_volume.vtk`. The final statuses are `final_exact_target` and
+`final_corrected_target`; `failed_11_b3` is diagnostic and never publishes a
+usable final NPZ or VTK. The runner records a failed shoe, continues the batch,
+and returns a non-success summary after processing the remaining shoes.
+`--resume` may be used instead of `--overwrite`; it reuses only complete B2/B3
+states after their configuration, digests, arrays, and geometry revalidate.
 
 ## Failure rules
 
@@ -902,10 +921,7 @@ jointly optimize the boundary and interior for states that stopped early.
 
 ## What comes next
 
-Checkpoint 11-B2 provides a valid continuation warm start, but it deliberately
-stops before an invalid target step. Checkpoint 11-B3 must jointly untangle the
-inner boundary and optimize the tetrahedral interior for every state marked
-`needs_11_b3`. Later steps will perform final bounded-distortion validation and
-implement the forward and inverse volume mappings. Toe articulation and other
-localized controls remain optional future containment work. High-heel SUPR
-fitting remains outside the current scope.
+Checkpoint 11-B3 produces the validated instance volumes required by the next
+stage. Checkpoint 11-C will implement the forward and inverse volume mappings.
+Toe articulation and other localized controls remain optional future
+containment work. High-heel SUPR fitting remains outside the current scope.

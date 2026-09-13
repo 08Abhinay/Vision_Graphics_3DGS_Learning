@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import numpy as np
+from scipy.spatial import cKDTree
 import trimesh
 
 from .alignment import CONTACT_REGION_RANGES
 from .mesh import TriangleMesh, sample_triangle_mesh_y
+
+
+@dataclass(frozen=True)
+class _TriangleBroadPhase:
+    """Reusable conservative triangle bounds for exact collision queries."""
+
+    minimum: np.ndarray
+    maximum: np.ndarray
+    centers: np.ndarray
+    radii: np.ndarray
+    maximum_radius: float
+    face_indices: np.ndarray
+    tree: cKDTree
 
 
 @dataclass(frozen=True)
@@ -429,41 +444,186 @@ def _triangle_intersections(
     return ~separated
 
 
-def _find_collision_pairs(
-    foot_triangles: np.ndarray,
-    foot_face_indices: np.ndarray,
-    obstacle_triangles: np.ndarray,
-    obstacle_face_indices: np.ndarray,
+def _build_triangle_broad_phase(
+    triangles: np.ndarray,
+    face_indices: np.ndarray,
+) -> _TriangleBroadPhase:
+    """Build a deterministic spatial index without changing exact predicates."""
+
+    triangle_array = np.asarray(triangles, dtype=np.float64)
+    indices = np.asarray(face_indices, dtype=np.int64)
+    if triangle_array.ndim != 3 or triangle_array.shape[1:] != (3, 3):
+        raise ValueError("triangle broad phase expects an (N, 3, 3) array")
+    if indices.shape != (len(triangle_array),):
+        raise ValueError("triangle broad-phase face IDs have invalid shape")
+    minimum = triangle_array.min(axis=1)
+    maximum = triangle_array.max(axis=1)
+    centers = 0.5 * (minimum + maximum)
+    radii = 0.5 * np.linalg.norm(maximum - minimum, axis=1)
+    return _TriangleBroadPhase(
+        minimum=minimum,
+        maximum=maximum,
+        centers=centers,
+        radii=radii,
+        maximum_radius=float(np.max(radii)) if len(radii) else 0.0,
+        face_indices=indices,
+        tree=cKDTree(centers),
+    )
+
+
+def _candidate_triangle_pairs(
+    first_triangles: np.ndarray,
+    second_broad_phase: _TriangleBroadPhase,
     tolerance: float,
 ) -> np.ndarray:
-    obstacle_minimum = obstacle_triangles.min(axis=1)
-    obstacle_maximum = obstacle_triangles.max(axis=1)
-    pairs: list[np.ndarray] = []
-    for triangle, foot_index in zip(foot_triangles, foot_face_indices):
-        minimum = triangle.min(axis=0) - tolerance
-        maximum = triangle.max(axis=0) + tolerance
-        overlaps = np.all(obstacle_maximum >= minimum, axis=1) & np.all(
-            obstacle_minimum <= maximum, axis=1
-        )
-        candidate_indices = np.flatnonzero(overlaps)
-        if len(candidate_indices) == 0:
+    """Return conservative local-index AABB pairs in deterministic order."""
+
+    first = np.asarray(first_triangles, dtype=np.float64)
+    if not len(first) or not len(second_broad_phase.minimum):
+        return np.empty((0, 2), dtype=np.int64)
+    first_minimum = first.min(axis=1)
+    first_maximum = first.max(axis=1)
+    first_centers = 0.5 * (first_minimum + first_maximum)
+    first_radii = 0.5 * np.linalg.norm(first_maximum - first_minimum, axis=1)
+    search_radii = (
+        first_radii
+        + second_broad_phase.maximum_radius
+        + math.sqrt(3.0) * float(tolerance)
+    )
+    nearby = second_broad_phase.tree.query_ball_point(
+        first_centers, search_radii
+    )
+    pair_blocks: list[np.ndarray] = []
+    for first_index, nearby_indices in enumerate(nearby):
+        candidates = np.asarray(nearby_indices, dtype=np.int64)
+        if not len(candidates):
             continue
+        minimum = first_minimum[first_index] - tolerance
+        maximum = first_maximum[first_index] + tolerance
+        overlaps = np.all(
+            second_broad_phase.maximum[candidates] >= minimum, axis=1
+        ) & np.all(second_broad_phase.minimum[candidates] <= maximum, axis=1)
+        candidates = candidates[overlaps]
+        if len(candidates):
+            pair_blocks.append(
+                np.column_stack(
+                    (
+                        np.full(len(candidates), first_index, dtype=np.int64),
+                        candidates,
+                    )
+                )
+            )
+    if not pair_blocks:
+        return np.empty((0, 2), dtype=np.int64)
+    pairs = np.concatenate(pair_blocks, axis=0)
+    return pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
+
+
+def _exact_collision_pairs(
+    first_triangles: np.ndarray,
+    first_face_indices: np.ndarray,
+    second_triangles: np.ndarray,
+    second_face_indices: np.ndarray,
+    candidate_pairs: np.ndarray,
+    tolerance: float,
+) -> np.ndarray:
+    """Apply the established SAT predicate to selected local triangle pairs."""
+
+    candidates = np.asarray(candidate_pairs, dtype=np.int64)
+    if not len(candidates):
+        return np.empty((0, 2), dtype=np.int64)
+    pairs: list[np.ndarray] = []
+    starts = np.flatnonzero(
+        np.r_[True, candidates[1:, 0] != candidates[:-1, 0]]
+    )
+    stops = np.r_[starts[1:], len(candidates)]
+    for start, stop in zip(starts, stops):
+        first_local = int(candidates[start, 0])
+        second_local = candidates[start:stop, 1]
         hits = _triangle_intersections(
-            triangle, obstacle_triangles[candidate_indices], tolerance
+            first_triangles[first_local], second_triangles[second_local], tolerance
         )
-        hit_faces = obstacle_face_indices[candidate_indices[hits]]
-        if len(hit_faces):
+        hit_local = second_local[hits]
+        if len(hit_local):
             pairs.append(
                 np.column_stack(
                     (
-                        np.full(len(hit_faces), foot_index, dtype=np.int64),
-                        hit_faces,
+                        np.full(
+                            len(hit_local),
+                            first_face_indices[first_local],
+                            dtype=np.int64,
+                        ),
+                        second_face_indices[hit_local],
                     )
                 )
             )
     if not pairs:
         return np.empty((0, 2), dtype=np.int64)
     return np.unique(np.concatenate(pairs, axis=0), axis=0)
+
+
+def _find_self_collision_pairs(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    tolerance: float,
+) -> np.ndarray:
+    """Find non-adjacent self-intersections without SAT-testing neighbors."""
+
+    topology = np.asarray(faces, dtype=np.int64)
+    triangles = np.asarray(vertices, dtype=np.float64)[topology]
+    indices = np.arange(len(topology), dtype=np.int64)
+    broad_phase = _build_triangle_broad_phase(triangles, indices)
+    candidates = _candidate_triangle_pairs(triangles, broad_phase, tolerance)
+    candidates = candidates[candidates[:, 0] < candidates[:, 1]]
+    if len(candidates):
+        first = topology[candidates[:, 0]]
+        second = topology[candidates[:, 1]]
+        shares_vertex = np.any(
+            first[:, :, None] == second[:, None, :], axis=(1, 2)
+        )
+        candidates = candidates[~shares_vertex]
+    return _exact_collision_pairs(
+        triangles,
+        indices,
+        triangles,
+        indices,
+        candidates,
+        tolerance,
+    )
+
+
+def _find_collision_pairs(
+    foot_triangles: np.ndarray,
+    foot_face_indices: np.ndarray,
+    obstacle_triangles: np.ndarray,
+    obstacle_face_indices: np.ndarray,
+    tolerance: float,
+    *,
+    obstacle_broad_phase: _TriangleBroadPhase | None = None,
+) -> np.ndarray:
+    foot_triangles = np.asarray(foot_triangles, dtype=np.float64)
+    foot_face_indices = np.asarray(foot_face_indices, dtype=np.int64)
+    obstacle_triangles = np.asarray(obstacle_triangles, dtype=np.float64)
+    obstacle_face_indices = np.asarray(obstacle_face_indices, dtype=np.int64)
+    broad_phase = obstacle_broad_phase or _build_triangle_broad_phase(
+        obstacle_triangles, obstacle_face_indices
+    )
+    if (
+        broad_phase.minimum.shape != (len(obstacle_triangles), 3)
+        or not np.array_equal(broad_phase.face_indices, obstacle_face_indices)
+    ):
+        raise ValueError("cached triangle broad phase belongs to another face array")
+    candidates = _candidate_triangle_pairs(
+        foot_triangles, broad_phase, tolerance
+    )
+    return _exact_collision_pairs(
+        foot_triangles,
+        foot_face_indices,
+        obstacle_triangles,
+        obstacle_face_indices,
+        candidates,
+        tolerance,
+    )
 
 
 def _closest_points_on_triangles(
